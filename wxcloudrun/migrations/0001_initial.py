@@ -10,18 +10,6 @@ class Migration(migrations.Migration):
 
     operations = [
         migrations.CreateModel(
-            name='Counters',
-            fields=[
-                ('id', models.AutoField(primary_key=True, serialize=False)),
-                ('count', models.IntegerField(default=0)),
-                ('createdAt', models.DateTimeField(default=django.utils.timezone.now)),
-                ('updatedAt', models.DateTimeField(auto_now=True)),
-            ],
-            options={
-                'db_table': 'Counters',
-            },
-        ),
-        migrations.CreateModel(
             name='EggFeedback',
             fields=[
                 ('id', models.BigAutoField(primary_key=True, serialize=False)),

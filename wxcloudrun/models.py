@@ -13,6 +13,7 @@ class Counters(models.Model):
 
     class Meta:
         db_table = 'Counters'
+        managed = False
 
 
 class EggFeedback(models.Model):
