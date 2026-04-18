@@ -196,3 +196,12 @@ STATIC_URL = '/static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 LOGS_DIR = '/data/logs/'
+
+ROCO_UPSTREAM_BASE_URL = os.environ.get('ROCO_UPSTREAM_BASE_URL', 'https://roco-eggs.tsuki-world.com').rstrip('/')
+ROCO_UPSTREAM_TIMEOUT_SECONDS = float(os.environ.get('ROCO_UPSTREAM_TIMEOUT_SECONDS', '8'))
+ROCO_UPSTREAM_CACHE_TTL_SECONDS = int(os.environ.get('ROCO_UPSTREAM_CACHE_TTL_SECONDS', '300'))
+EGG_DEV_ADMIN_TOKEN = os.environ.get('EGG_DEV_ADMIN_TOKEN', '')
+try:
+    EGG_DEV_EXPORT_MAX_PAGE_SIZE = int(os.environ.get('EGG_DEV_EXPORT_MAX_PAGE_SIZE', '100'))
+except (TypeError, ValueError):
+    EGG_DEV_EXPORT_MAX_PAGE_SIZE = 100

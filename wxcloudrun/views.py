@@ -1,15 +1,18 @@
 import hashlib
+import hmac
 import json
 import logging
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 
 from django.conf import settings
+from django.db import transaction
 from django.http import JsonResponse
 from django.shortcuts import render
 from django.utils import timezone
 
-from wxcloudrun.models import Counters, EggFeedback
+from wxcloudrun.models import Counters, EggFeedback, EggPredictorConfig
+from wxcloudrun.upstream_predict import UpstreamPredictError, fetch_upstream_prediction
 
 
 logger = logging.getLogger('log')
@@ -18,9 +21,19 @@ MAX_SNAPSHOT_COUNT = 10
 MAX_SPECIES_LENGTH = 64
 MAX_REPORTS_PER_HOUR = 20
 MAX_REPORTS_PER_HOUR_PER_IP = 60
+DEFAULT_DEV_EXPORT_PAGE_SIZE = 50
+DEFAULT_DEV_HISTORY_LIMIT = 8
 
 
 class ValidationError(Exception):
+    pass
+
+
+class PermissionDeniedError(Exception):
+    pass
+
+
+class ServiceUnavailableError(Exception):
     pass
 
 
@@ -38,6 +51,113 @@ def index(request, _):
     return render(request, 'index.html')
 
 
+def build_feedback_response_data(record, duplicated=False):
+    return {
+        'recordId': record.id,
+        'duplicated': duplicated,
+        'qualityStatus': record.quality_status,
+        'qualityScore': record.quality_score,
+        'upstreamVerificationStatus': getattr(
+            record,
+            'upstream_verification_status',
+            EggFeedback.VERIFICATION_UNKNOWN,
+        ),
+        'upstreamTop1Species': getattr(record, 'upstream_top1_species', ''),
+        'upstreamConfirmedRank': getattr(record, 'upstream_confirmed_rank', None),
+    }
+
+
+def build_feedback_export_row(record):
+    try:
+        prediction_snapshot = json.loads(record.prediction_snapshot or '[]')
+    except json.JSONDecodeError:
+        prediction_snapshot = []
+
+    return {
+        'id': record.id,
+        'request_id': record.request_id,
+        'prediction_session_id': record.prediction_session_id,
+        'source': record.source,
+        'size': float(record.size),
+        'weight': float(record.weight),
+        'rideable_only': bool(record.rideable_only),
+        'confirmed_species': record.confirmed_species,
+        'predicted_species': record.predicted_species,
+        'predicted_rank': record.predicted_rank,
+        'predicted_probability': (
+            float(record.predicted_probability)
+            if record.predicted_probability is not None
+            else None
+        ),
+        'prediction_version': record.prediction_version,
+        'prediction_snapshot': prediction_snapshot,
+        'candidate_count': record.candidate_count,
+        'is_custom_species': bool(record.is_custom_species),
+        'species_in_snapshot': bool(record.species_in_snapshot),
+        'quality_status': record.quality_status,
+        'quality_score': record.quality_score,
+        'review_note': record.review_note,
+        'upstream_verification_status': record.upstream_verification_status,
+        'upstream_top1_species': record.upstream_top1_species,
+        'upstream_top1_probability': (
+            float(record.upstream_top1_probability)
+            if record.upstream_top1_probability is not None
+            else None
+        ),
+        'upstream_confirmed_rank': record.upstream_confirmed_rank,
+        'upstream_confirmed_probability': (
+            float(record.upstream_confirmed_probability)
+            if record.upstream_confirmed_probability is not None
+            else None
+        ),
+        'upstream_checked_at': format_datetime(record.upstream_checked_at),
+        'appid': record.appid,
+        'openid_hash': record.openid_hash,
+        'ip_hash': record.ip_hash,
+        'user_agent': record.user_agent,
+        'created_at': format_datetime(record.created_at),
+        'updated_at': format_datetime(record.updated_at),
+    }
+
+
+def serialize_predictor_config(record, include_config_json=True):
+    if not record:
+        return build_default_predictor_config()
+
+    config_data = parse_stored_json_object(record.config_json)
+    payload = {
+        'id': record.id,
+        'version': record.version,
+        'strategy': record.strategy,
+        'modelType': record.model_type,
+        'artifactUri': record.artifact_uri,
+        'notes': record.notes,
+        'isActive': bool(record.is_active),
+        'createdAt': format_datetime(record.created_at),
+        'updatedAt': format_datetime(record.updated_at),
+        'configKeyCount': len(config_data),
+    }
+    if include_config_json:
+        payload['configJson'] = config_data
+    return payload
+
+
+def build_default_predictor_config():
+    return {
+        'id': None,
+        'version': 'upstream-proxy-default',
+        'strategy': EggPredictorConfig.STRATEGY_UPSTREAM_PROXY,
+        'modelType': 'proxy_only',
+        'artifactUri': '',
+        'notes': '当前线上预测仍走源站代理，开发者配置仅用于版本登记和后续模型切换准备。',
+        'isActive': True,
+        'createdAt': '',
+        'updatedAt': '',
+        'configKeyCount': 0,
+        'configJson': {},
+    }
+
+
 def counter(request, _):
     try:
         if request.method == 'GET':
@@ -52,6 +172,33 @@ def counter(request, _):
     return rsp
 
 
+def egg_predict(request, _):
+    if request.method != 'POST':
+        rsp = json_response(-1, '请求方式错误', status=405)
+        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        return rsp
+
+    try:
+        payload = parse_predict_payload(request)
+        upstream_data = fetch_upstream_prediction(
+            payload['size'],
+            payload['weight'],
+            payload['rideable_only'],
+        )
+        rsp = json_response(0, '', upstream_data)
+    except ValidationError as error:
+        rsp = json_response(40001, str(error), status=400)
+    except UpstreamPredictError as error:
+        logger.warning('upstream predict failed: %s', error)
+        rsp = json_response(50201, str(error), status=502)
+    except Exception:
+        logger.exception('egg predict unexpected error')
+        rsp = json_response(50002, '预测服务暂时不可用，请稍后再试', status=500)
+
+    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    return rsp
+
+
 def egg_feedback(request, _):
     if request.method != 'POST':
         rsp = json_response(-1, '请求方式错误', status=405)
@@ -62,16 +209,7 @@ def egg_feedback(request, _):
         payload = parse_feedback_payload(request)
         existing = find_existing_feedback(payload)
         if existing:
-            rsp = json_response(
-                0,
-                '',
-                {
-                    'recordId': existing.id,
-                    'duplicated': True,
-                    'qualityStatus': existing.quality_status,
-                    'qualityScore': existing.quality_score,
-                }
-            )
+            rsp = json_response(0, '', build_feedback_response_data(existing, duplicated=True))
             logger.info('response result: %s', rsp.content.decode('utf-8'))
             return rsp
 
@@ -106,21 +244,150 @@ def egg_feedback(request, _):
             ip_hash=payload['ip_hash'],
             user_agent=payload['user_agent'],
         )
-        rsp = json_response(
-            0,
-            '',
-            {
-                'recordId': record.id,
-                'duplicated': False,
-                'qualityStatus': quality_status,
-                'qualityScore': quality_score,
-            }
-        )
+        rsp = json_response(0, '', build_feedback_response_data(record, duplicated=False))
     except ValidationError as error:
         rsp = json_response(40001, str(error), status=400)
     except Exception:
         logger.exception('egg feedback unexpected error')
         rsp = json_response(50001, '提交失败，请稍后重试', status=500)
+
+    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    return rsp
+
+
+def dev_feedback_export(request, _):
+    if request.method not in {'GET', 'POST'}:
+        rsp = json_response(-1, '请求方式错误', status=405)
+        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        return rsp
+
+    try:
+        request_data = request.GET if request.method == 'GET' else parse_json_body(request)
+        require_dev_admin(request)
+        payload = parse_feedback_export_payload(request_data)
+
+        queryset = EggFeedback.objects.all().order_by('-id')
+        if payload['cursor']:
+            queryset = queryset.filter(id__lt=payload['cursor'])
+        if payload['quality_statuses']:
+            queryset = queryset.filter(quality_status__in=payload['quality_statuses'])
+        if payload['min_quality_score'] > 0:
+            queryset = queryset.filter(quality_score__gte=payload['min_quality_score'])
+        if not payload['include_custom']:
+            queryset = queryset.filter(is_custom_species=False)
+
+        rows = list(queryset[:payload['page_size'] + 1])
+        has_more = len(rows) > payload['page_size']
+        rows = rows[:payload['page_size']]
+        next_cursor = rows[-1].id if has_more and rows else 0
+
+        rsp = json_response(
+            0,
+            '',
+            {
+                'rows': [build_feedback_export_row(item) for item in rows],
+                'returnedCount': len(rows),
+                'pageSize': payload['page_size'],
+                'hasMore': has_more,
+                'nextCursor': next_cursor,
+                'filters': {
+                    'cursor': payload['cursor'],
+                    'qualityStatuses': payload['quality_statuses'],
+                    'minQualityScore': payload['min_quality_score'],
+                    'includeCustom': payload['include_custom'],
+                },
+                'exportedAt': format_datetime(timezone.now()),
+            },
+        )
+    except PermissionDeniedError as error:
+        rsp = json_response(40301, str(error), status=403)
+    except ServiceUnavailableError as error:
+        rsp = json_response(50301, str(error), status=503)
+    except ValidationError as error:
+        rsp = json_response(40001, str(error), status=400)
+    except Exception:
+        logger.exception('dev feedback export unexpected error')
+        rsp = json_response(50003, '导出失败，请稍后重试', status=500)
+
+    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    return rsp
+
+
+def dev_model_config(request, _):
+    if request.method not in {'GET', 'POST'}:
+        rsp = json_response(-1, '请求方式错误', status=405)
+        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        return rsp
+
+    try:
+        require_dev_admin(request)
+
+        if request.method == 'GET':
+            active_record = EggPredictorConfig.objects.filter(is_active=True).order_by('-updated_at', '-id').first()
+            history_records = EggPredictorConfig.objects.order_by('-updated_at', '-id')[:DEFAULT_DEV_HISTORY_LIMIT]
+            rsp = json_response(
+                0,
+                '',
+                {
+                    'active': serialize_predictor_config(active_record, include_config_json=True),
+                    'history': [
+                        serialize_predictor_config(item, include_config_json=False)
+                        for item in history_records
+                    ],
+                },
+            )
+        else:
+            body = parse_json_body(request)
+            payload = parse_predictor_config_payload(body)
+            current_active = EggPredictorConfig.objects.filter(is_active=True).order_by('-updated_at', '-id').first()
+
+            duplicated = bool(
+                current_active and
+                current_active.version == payload['version'] and
+                current_active.strategy == payload['strategy'] and
+                current_active.model_type == payload['model_type'] and
+                current_active.artifact_uri == payload['artifact_uri'] and
+                current_active.config_json == payload['config_json'] and
+                current_active.notes == payload['notes']
+            )
+
+            if duplicated:
+                record = current_active
+            else:
+                with transaction.atomic():
+                    EggPredictorConfig.objects.filter(is_active=True).update(is_active=False)
+                    record = EggPredictorConfig.objects.create(
+                        version=payload['version'],
+                        strategy=payload['strategy'],
+                        model_type=payload['model_type'],
+                        artifact_uri=payload['artifact_uri'],
+                        config_json=payload['config_json'],
+                        notes=payload['notes'],
+                        is_active=True,
+                    )
+
+            history_records = EggPredictorConfig.objects.order_by('-updated_at', '-id')[:DEFAULT_DEV_HISTORY_LIMIT]
+            rsp = json_response(
+                0,
+                '',
+                {
+                    'duplicated': duplicated,
+                    'active': serialize_predictor_config(record, include_config_json=True),
+                    'history': [
+                        serialize_predictor_config(item, include_config_json=False)
+                        for item in history_records
+                    ],
+                },
+            )
+    except PermissionDeniedError as error:
+        rsp = json_response(40301, str(error), status=403)
+    except ServiceUnavailableError as error:
+        rsp = json_response(50301, str(error), status=503)
+    except ValidationError as error:
+        rsp = json_response(40001, str(error), status=400)
+    except Exception:
+        logger.exception('dev model config unexpected error')
+        rsp = json_response(50004, '配置保存失败，请稍后重试', status=500)
 
     logger.info('response result: %s', rsp.content.decode('utf-8'))
     return rsp
@@ -162,6 +429,23 @@ def update_count(request):
     return json_response(-1, 'action 参数错误', status=400)
 
 
+def parse_predict_payload(request):
+    body = parse_json_body(request)
+    size = parse_decimal_field(body.get('size'), '尺寸')
+    weight = parse_decimal_field(body.get('weight'), '重量')
+    if size <= 0 or size > Decimal('999.9999'):
+        raise ValidationError('尺寸参数超出允许范围')
+    if weight <= 0 or weight > Decimal('9999.9999'):
+        raise ValidationError('重量参数超出允许范围')
+
+    rideable_value = body.get('rideableOnly') if 'rideableOnly' in body else body.get('rideable_only')
+    return {
+        'size': size,
+        'weight': weight,
+        'rideable_only': parse_boolean(rideable_value),
+    }
+
+
 def parse_feedback_payload(request):
     body = parse_json_body(request)
     size = parse_decimal_field(body.get('size'), '尺寸')
@@ -197,7 +481,7 @@ def parse_feedback_payload(request):
 
     matched_snapshot = next(
         (item for item in prediction_snapshot if item['species'] == confirmed_species),
-        None
+        None,
     )
 
     if source == EggFeedback.SOURCE_TOP1:
@@ -238,13 +522,15 @@ def parse_feedback_payload(request):
         ])
     )
 
+    rideable_value = body.get('rideableOnly') if 'rideableOnly' in body else body.get('rideable_only')
+
     return {
         'request_id': request_id,
         'prediction_session_id': prediction_session_id,
         'source': source,
         'size': size,
         'weight': weight,
-        'rideable_only': parse_boolean(body.get('rideableOnly')),
+        'rideable_only': parse_boolean(rideable_value),
         'confirmed_species': confirmed_species,
         'predicted_species': predicted_species,
         'predicted_rank': predicted_rank,
@@ -257,6 +543,63 @@ def parse_feedback_payload(request):
         'openid_hash': openid_hash,
         'ip_hash': ip_hash,
         'user_agent': user_agent,
+    }
+
+
+def parse_feedback_export_payload(data):
+    page_size = parse_int_field(
+        data.get('pageSize', DEFAULT_DEV_EXPORT_PAGE_SIZE),
+        'pageSize',
+        minimum=1,
+        maximum=get_dev_export_max_page_size(),
+    )
+    cursor = parse_int_field(data.get('cursor', 0), 'cursor', minimum=0)
+    min_quality_score = parse_int_field(
+        data.get('minQualityScore', 0),
+        'minQualityScore',
+        minimum=0,
+        maximum=100,
+    )
+    quality_statuses = parse_choice_list(
+        data.get('qualityStatuses'),
+        {choice[0] for choice in EggFeedback.STATUS_CHOICES},
+        'qualityStatuses',
+    )
+    include_custom = True
+    if 'includeCustom' in data:
+        include_custom = parse_boolean(data.get('includeCustom'))
+
+    return {
+        'page_size': page_size,
+        'cursor': cursor,
+        'min_quality_score': min_quality_score,
+        'quality_statuses': quality_statuses,
+        'include_custom': include_custom,
+    }
+
+
+def parse_predictor_config_payload(data):
+    version = normalize_token(data.get('version'), 64)
+    if not version:
+        raise ValidationError('version 不能为空')
+
+    strategy = normalize_token(data.get('strategy'), 32)
+    allowed_strategies = {choice[0] for choice in EggPredictorConfig.STRATEGY_CHOICES}
+    if strategy not in allowed_strategies:
+        raise ValidationError('strategy 参数错误')
+
+    model_type = normalize_token(data.get('modelType'), 64)
+    artifact_uri = normalize_text(data.get('artifactUri'), 512)
+    notes = normalize_text(data.get('notes'), 255)
+    config_data = parse_json_object_field(data.get('configJson'), 'configJson')
+
+    return {
+        'version': version,
+        'strategy': strategy,
+        'model_type': model_type,
+        'artifact_uri': artifact_uri,
+        'notes': notes,
+        'config_json': json.dumps(config_data, ensure_ascii=False, sort_keys=True),
     }
 
 
@@ -276,12 +619,78 @@ def parse_decimal_field(value, label):
     return decimal_value.quantize(Decimal('0.0001'))
 
 
+def parse_int_field(value, label, minimum=None, maximum=None):
+    try:
+        int_value = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValidationError(f'{label} 参数格式错误') from error
+
+    if minimum is not None and int_value < minimum:
+        raise ValidationError(f'{label} 参数超出允许范围')
+    if maximum is not None and int_value > maximum:
+        raise ValidationError(f'{label} 参数超出允许范围')
+    return int_value
+
+
 def parse_boolean(value):
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
         return value.strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
     return bool(value)
+
+
+def parse_choice_list(value, allowed_values, label):
+    items = parse_text_list(value)
+    invalid_items = [item for item in items if item not in allowed_values]
+    if invalid_items:
+        raise ValidationError(f'{label} 包含不支持的值')
+    return items
+
+
+def parse_text_list(value):
+    if value is None or value == '':
+        return []
+    if isinstance(value, (list, tuple, set)):
+        raw_items = value
+    else:
+        raw_items = str(value).split(',')
+
+    cleaned = []
+    seen = set()
+    for item in raw_items:
+        normalized = str(item).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        cleaned.append(normalized)
+    return cleaned
+
+
+def parse_json_object_field(value, label):
+    if value in (None, ''):
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as error:
+            raise ValidationError(f'{label} 不是合法 JSON') from error
+        if not isinstance(parsed, dict):
+            raise ValidationError(f'{label} 需要是 JSON 对象')
+        return parsed
+    raise ValidationError(f'{label} 参数格式错误')
+
+
+def parse_stored_json_object(value):
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def sanitize_prediction_snapshot(snapshot):
@@ -292,20 +701,20 @@ def sanitize_prediction_snapshot(snapshot):
     for raw_item in snapshot[:MAX_SNAPSHOT_COUNT]:
         if not isinstance(raw_item, dict):
             continue
+
         species = normalize_species_name(raw_item.get('species'))
         if not species:
             continue
-        rank = raw_item.get('rank')
+
         try:
-            rank = int(rank)
-        except (TypeError, ValueError):
-            raise ValidationError('候选 rank 参数格式错误')
+            rank = int(raw_item.get('rank'))
+        except (TypeError, ValueError) as error:
+            raise ValidationError('候选 rank 参数格式错误') from error
         if rank <= 0 or rank > MAX_SNAPSHOT_COUNT:
             raise ValidationError('候选 rank 参数超出范围')
 
-        prob_value = raw_item.get('prob')
         try:
-            prob = Decimal(str(prob_value)).quantize(Decimal('0.0001'))
+            prob = Decimal(str(raw_item.get('prob'))).quantize(Decimal('0.0001'))
         except (InvalidOperation, TypeError, ValueError) as error:
             raise ValidationError('候选概率参数格式错误') from error
         if prob < 0 or prob > 1:
@@ -340,6 +749,13 @@ def normalize_token(value, max_length=64):
     return normalized[:max_length]
 
 
+def normalize_text(value, max_length=255):
+    if value is None:
+        return ''
+    normalized = ' '.join(str(value).strip().split())
+    return normalized[:max_length]
+
+
 def get_header(request, header_name):
     meta_key = f'HTTP_{header_name.upper().replace("-", "_")}'
     return request.META.get(meta_key, '')
@@ -359,6 +775,19 @@ def build_secure_hash(value):
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()
 
 
+def require_dev_admin(request):
+    configured_token = str(getattr(settings, 'EGG_DEV_ADMIN_TOKEN', '') or '').strip()
+    if not configured_token:
+        raise ServiceUnavailableError('开发者接口未配置 EGG_DEV_ADMIN_TOKEN')
+
+    provided_token = str(get_header(request, 'X-DEV-ADMIN-TOKEN') or '').strip()
+    if not provided_token:
+        raise PermissionDeniedError('缺少开发者令牌')
+
+    if not hmac.compare_digest(provided_token, configured_token):
+        raise PermissionDeniedError('开发者令牌无效')
+
+
 def find_existing_feedback(payload):
     session_filters = {'prediction_session_id': payload['prediction_session_id']}
     if payload['openid_hash']:
@@ -374,8 +803,7 @@ def find_existing_feedback(payload):
 
 
 def get_rate_limit_error(payload):
-    now = timezone.now()
-    one_hour_ago = now - timedelta(hours=1)
+    one_hour_ago = timezone.now() - timedelta(hours=1)
 
     if payload['openid_hash']:
         recent_count = EggFeedback.objects.filter(
@@ -397,25 +825,38 @@ def get_rate_limit_error(payload):
 
 
 def build_quality_result(payload):
-    score = 55
-    review_note = ''
+    score = 48
+    notes = []
     status = EggFeedback.STATUS_ACCEPTED
 
     if payload['openid_hash']:
-        score += 10
+        score += 12
+    else:
+        notes.append('匿名样本')
+
     if payload['prediction_snapshot']:
         score += 8
+
     if payload['source'] == EggFeedback.SOURCE_TOP1:
-        score += 20
+        score += 22
+        notes.append('Top1 直接确认')
     elif payload['source'] == EggFeedback.SOURCE_TOP10:
         score += 14
+        notes.append('Top10 候选确认')
     else:
-        score -= 8
+        score -= 6
         status = EggFeedback.STATUS_PENDING
-        review_note = '自定义精灵待人工归并'
+        notes.append('自定义精灵待离线清洗归并')
 
     if payload['species_in_snapshot']:
-        score += 6
+        score += 8
+
+    if payload['predicted_species'] == payload['confirmed_species']:
+        score += 4
+
+    if str(payload['prediction_version']).startswith('upstream'):
+        score += 4
+        notes.append('预测来自云端代理')
 
     recent_window = timezone.now() - timedelta(minutes=20)
     recent_openid_count = 0
@@ -436,6 +877,21 @@ def build_quality_result(payload):
     if recent_openid_count >= 6 or recent_ip_count >= 12:
         score = max(score - 25, 0)
         status = EggFeedback.STATUS_SUSPICIOUS
-        review_note = '短时间内高频提交，建议复核'
+        notes = ['短时间内高频提交，建议复核']
 
+    review_note = '；'.join(dict.fromkeys(note for note in notes if note))
     return status, min(max(score, 0), 100), review_note
+
+
+def format_datetime(value):
+    if not value:
+        return ''
+    return value.isoformat()
+
+
+def get_dev_export_max_page_size():
+    try:
+        value = int(getattr(settings, 'EGG_DEV_EXPORT_MAX_PAGE_SIZE', '100'))
+    except (TypeError, ValueError):
+        value = 100
+    return max(1, min(value, 200))

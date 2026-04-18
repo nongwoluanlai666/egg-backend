@@ -35,6 +35,21 @@ class EggFeedback(models.Model):
         (STATUS_SUSPICIOUS, 'Suspicious'),
     )
 
+    VERIFICATION_UNKNOWN = 'unknown'
+    VERIFICATION_MATCHED = 'matched'
+    VERIFICATION_TOP10 = 'top10'
+    VERIFICATION_PRESENT = 'present'
+    VERIFICATION_MISMATCH = 'mismatch'
+    VERIFICATION_ERROR = 'error'
+    VERIFICATION_CHOICES = (
+        (VERIFICATION_UNKNOWN, 'Unknown'),
+        (VERIFICATION_MATCHED, 'Matched'),
+        (VERIFICATION_TOP10, 'Top 10'),
+        (VERIFICATION_PRESENT, 'Present'),
+        (VERIFICATION_MISMATCH, 'Mismatch'),
+        (VERIFICATION_ERROR, 'Error'),
+    )
+
     id = models.BigAutoField(primary_key=True)
     request_id = models.CharField(max_length=64, unique=True)
     prediction_session_id = models.CharField(max_length=64, db_index=True)
@@ -54,6 +69,17 @@ class EggFeedback(models.Model):
     quality_status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_PENDING)
     quality_score = models.PositiveSmallIntegerField(default=0)
     review_note = models.CharField(max_length=255, blank=True, default='')
+    upstream_top1_species = models.CharField(max_length=64, blank=True, default='')
+    upstream_top1_probability = models.DecimalField(max_digits=6, decimal_places=4, null=True, blank=True)
+    upstream_confirmed_rank = models.PositiveSmallIntegerField(null=True, blank=True)
+    upstream_confirmed_probability = models.DecimalField(max_digits=6, decimal_places=4, null=True, blank=True)
+    upstream_verification_status = models.CharField(
+        max_length=16,
+        choices=VERIFICATION_CHOICES,
+        default=VERIFICATION_UNKNOWN,
+        db_index=True,
+    )
+    upstream_checked_at = models.DateTimeField(null=True, blank=True)
     appid = models.CharField(max_length=64, blank=True, default='')
     openid_hash = models.CharField(max_length=64, db_index=True, blank=True, default='')
     ip_hash = models.CharField(max_length=64, db_index=True, blank=True, default='')
@@ -70,4 +96,40 @@ class EggFeedback(models.Model):
             models.Index(fields=['openid_hash', 'created_at'], name='eggfb_openid_idx'),
             models.Index(fields=['ip_hash', 'created_at'], name='eggfb_ip_idx'),
             models.Index(fields=['prediction_session_id', 'created_at'], name='eggfb_session_idx'),
+        ]
+
+
+class EggPredictorConfig(models.Model):
+    STRATEGY_UPSTREAM_PROXY = 'upstream_proxy'
+    STRATEGY_CLOUD_MODEL = 'cloud_model'
+    STRATEGY_HYBRID = 'hybrid'
+    STRATEGY_CHOICES = (
+        (STRATEGY_UPSTREAM_PROXY, 'Upstream Proxy'),
+        (STRATEGY_CLOUD_MODEL, 'Cloud Model'),
+        (STRATEGY_HYBRID, 'Hybrid'),
+    )
+
+    id = models.BigAutoField(primary_key=True)
+    version = models.CharField(max_length=64, db_index=True)
+    strategy = models.CharField(
+        max_length=32,
+        choices=STRATEGY_CHOICES,
+        default=STRATEGY_UPSTREAM_PROXY,
+        db_index=True,
+    )
+    model_type = models.CharField(max_length=64, blank=True, default='')
+    artifact_uri = models.CharField(max_length=512, blank=True, default='')
+    config_json = models.TextField(blank=True, default='{}')
+    notes = models.CharField(max_length=255, blank=True, default='')
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f'{self.version} ({self.strategy})'
+
+    class Meta:
+        db_table = 'EggPredictorConfig'
+        indexes = [
+            models.Index(fields=['is_active', 'updated_at'], name='eggcfg_active_idx'),
         ]
