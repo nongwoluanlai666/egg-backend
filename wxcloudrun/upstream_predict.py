@@ -8,7 +8,7 @@ from django.conf import settings
 
 
 DEFAULT_BASE_URL = 'https://roco-eggs.tsuki-world.com'
-DEFAULT_TIMEOUT_SECONDS = 8
+DEFAULT_TIMEOUT_SECONDS = 5
 DEFAULT_CACHE_TTL_SECONDS = 300
 
 _CACHE_LOCK = threading.Lock()
