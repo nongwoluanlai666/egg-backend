@@ -205,3 +205,24 @@ try:
     EGG_DEV_EXPORT_MAX_PAGE_SIZE = int(os.environ.get('EGG_DEV_EXPORT_MAX_PAGE_SIZE', '100'))
 except (TypeError, ValueError):
     EGG_DEV_EXPORT_MAX_PAGE_SIZE = 100
+
+
+def parse_env_bool(name, default='false'):
+    return str(os.environ.get(name, default)).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+
+
+EGG_MODEL_ARTIFACT_URI = os.environ.get('EGG_MODEL_ARTIFACT_URI', '').strip()
+EGG_MODEL_DEFAULT_RELATIVE_PATH = os.environ.get(
+    'EGG_MODEL_DEFAULT_RELATIVE_PATH',
+    'model_artifacts/egg_model_v2.joblib.gz',
+).strip()
+EGG_MODEL_PRELOAD_ON_START = parse_env_bool('EGG_MODEL_PRELOAD_ON_START', 'true')
+EGG_MODEL_DOWNLOAD_CACHE_DIR = os.environ.get('EGG_MODEL_DOWNLOAD_CACHE_DIR', '/tmp/egg_model_cache').strip()
+try:
+    EGG_MODEL_DOWNLOAD_TIMEOUT_SECONDS = float(os.environ.get('EGG_MODEL_DOWNLOAD_TIMEOUT_SECONDS', '20'))
+except (TypeError, ValueError):
+    EGG_MODEL_DOWNLOAD_TIMEOUT_SECONDS = 20.0
+try:
+    EGG_MODEL_TOP_K = int(os.environ.get('EGG_MODEL_TOP_K', '10'))
+except (TypeError, ValueError):
+    EGG_MODEL_TOP_K = 10

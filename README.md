@@ -123,3 +123,59 @@ curl -X POST -H 'content-type: application/json' -d '{"action": "inc"}' https://
 ## License
 
 [MIT](./LICENSE)
+
+## Egg Predictor Runtime
+
+Current `POST /api/egg-predict` behavior:
+
+1. try the upstream predictor first
+2. if upstream fails, fall back to the packaged or configured local model
+3. if both fail, return `502`
+
+Default packaged model path:
+
+- `model_artifacts/egg_model_v2.joblib.gz`
+
+Important backend env vars:
+
+- `ROCO_UPSTREAM_BASE_URL`
+- `ROCO_UPSTREAM_TIMEOUT_SECONDS`
+- `ROCO_UPSTREAM_CACHE_TTL_SECONDS`
+- `EGG_MODEL_ARTIFACT_URI`
+- `EGG_MODEL_DEFAULT_RELATIVE_PATH`
+- `EGG_MODEL_PRELOAD_ON_START`
+- `EGG_MODEL_DOWNLOAD_CACHE_DIR`
+- `EGG_MODEL_DOWNLOAD_TIMEOUT_SECONDS`
+- `EGG_MODEL_TOP_K`
+
+## Local Train To Deploy
+
+1. Prepare feedback rows locally:
+
+```powershell
+.\.venv\Scripts\python.exe update\model\dataClean.py --feedback-csv "update\数据库导出\<your-file>.csv"
+```
+
+If upstream is unstable:
+
+```powershell
+.\.venv\Scripts\python.exe update\model\dataClean.py --skip-upstream --feedback-csv "update\数据库导出\<your-file>.csv"
+```
+
+2. Train the model:
+
+```powershell
+.\.venv\Scripts\python.exe update\model\dataTrain.py
+```
+
+3. Copy the trained model into the backend package:
+
+```powershell
+Copy-Item update\model\model\egg_model_v2.joblib.gz egg_backend\egg-backend\model_artifacts\egg_model_v2.joblib.gz -Force
+```
+
+4. Rebuild and deploy the cloud container.
+
+For the more detailed workflow, see:
+
+- `FEEDBACK_DESIGN.md`

@@ -7,7 +7,7 @@
 	"minNum": 0,                                  
 	"maxNum": 5,                                  
 	"cpu": 1,                                    
-	"mem": 2,                                    
+	"mem": 4,                                    
 	"policyType": "cpu",                           
 	"policyThreshold": 60,
 	"policyDetails": [

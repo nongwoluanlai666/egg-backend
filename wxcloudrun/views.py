@@ -11,6 +11,12 @@ from django.http import JsonResponse
 from django.shortcuts import render
 from django.utils import timezone
 
+from wxcloudrun.local_model_predict import (
+    LocalModelPredictError,
+    get_local_model_runtime_summary,
+    predict_with_local_model,
+    reset_local_model_cache,
+)
 from wxcloudrun.models import Counters, EggFeedback, EggPredictorConfig
 from wxcloudrun.upstream_predict import UpstreamPredictError, fetch_upstream_prediction
 
@@ -143,18 +149,24 @@ def serialize_predictor_config(record, include_config_json=True):
 
 
 def build_default_predictor_config():
+    runtime = get_local_model_runtime_summary()
     return {
         'id': None,
-        'version': 'upstream-proxy-default',
-        'strategy': EggPredictorConfig.STRATEGY_UPSTREAM_PROXY,
-        'modelType': 'proxy_only',
-        'artifactUri': '',
-        'notes': '当前线上预测仍走源站代理，开发者配置仅用于版本登记和后续模型切换准备。',
+        'version': runtime.get('version') or 'hybrid-default',
+        'strategy': EggPredictorConfig.STRATEGY_HYBRID,
+        'modelType': runtime.get('modelType') or 'sklearn_random_forest_joblib',
+        'artifactUri': runtime.get('artifactUri') or runtime.get('artifactPath') or '',
+        'notes': '当前线上预测链路为上游优先，失败时回退到云托管本地模型。',
         'isActive': True,
         'createdAt': '',
         'updatedAt': '',
         'configKeyCount': 0,
-        'configJson': {},
+        'configJson': {
+            'runtimeAvailable': runtime.get('available', False),
+            'runtimeSource': runtime.get('source', ''),
+            'runtimeError': runtime.get('error', ''),
+            'classCount': runtime.get('classCount', 0),
+        },
     }
 
 
@@ -190,7 +202,19 @@ def egg_predict(request, _):
         rsp = json_response(40001, str(error), status=400)
     except UpstreamPredictError as error:
         logger.warning('upstream predict failed: %s', error)
-        rsp = json_response(50201, str(error), status=502)
+        try:
+            fallback_data = predict_with_local_model(
+                payload['size'],
+                payload['weight'],
+                payload['rideable_only'],
+            )
+            fallback_data['fallbackApplied'] = True
+            fallback_data['fallbackReason'] = 'upstream_unavailable'
+            fallback_data['upstreamError'] = str(error)
+            rsp = json_response(0, '', fallback_data)
+        except LocalModelPredictError as model_error:
+            logger.warning('local model fallback failed: %s', model_error)
+            rsp = json_response(50201, f'{error}; local model fallback failed: {model_error}', status=502)
     except Exception:
         logger.exception('egg predict unexpected error')
         rsp = json_response(50002, '预测服务暂时不可用，请稍后再试', status=500)
@@ -365,6 +389,7 @@ def dev_model_config(request, _):
                         notes=payload['notes'],
                         is_active=True,
                     )
+                reset_local_model_cache()
 
             history_records = EggPredictorConfig.objects.order_by('-updated_at', '-id')[:DEFAULT_DEV_HISTORY_LIMIT]
             rsp = json_response(
