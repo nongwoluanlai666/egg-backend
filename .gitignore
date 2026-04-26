@@ -1,0 +1,4 @@
+/wxcloudrun/migrations/__pycache__/*.pyc
+/wxcloudrun/__pycache__/*.pyc
+/wxcloudrun/management/commands/__pycache__/*.pyc
+/logs/*.log

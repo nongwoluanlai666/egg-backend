@@ -23,7 +23,7 @@ from wxcloudrun.models import (
 logger = logging.getLogger('log')
 
 DEFAULT_SPECIAL_KEYWORDS = ('炫彩', '棱镜球', '同乘', '祝福项坠')
-DEFAULT_NOTICE_ADVICE = '打开蛋查查重新开启下次提醒'
+DEFAULT_NOTICE_ADVICE = '建议点击打开蛋查查，并开启下次提醒'
 ROUND_START_HOURS = (8, 12, 16, 20)
 WECHAT_TOKEN_URL = 'https://api.weixin.qq.com/cgi-bin/token'
 WECHAT_SUBSCRIBE_SEND_URL = 'https://api.weixin.qq.com/cgi-bin/message/subscribe/send'
@@ -165,6 +165,11 @@ def format_round_window(slot_date, round_number):
     if start_at.date() == end_at.date():
         return f'{start_text}-{end_at.strftime("%H:%M")}'
     return f'{start_text}-次日{end_at.strftime("%H:%M")}'
+
+
+def format_round_notice_time(slot_date, round_number):
+    start_at, _ = build_round_window(slot_date, round_number)
+    return start_at.strftime('%m-%d %H:%M')
 
 
 def format_round_label(round_number, total_rounds):
@@ -632,7 +637,7 @@ def build_subscribe_message_body(subscription, snapshot):
         'page': str(getattr(settings, 'MERCHANT_NOTIFY_PAGE', 'pages/merchant-notice/index') or 'pages/merchant-notice/index').strip(),
         'data': {
             'date2': {
-                'value': format_round_window(snapshot.slot_date, snapshot.round),
+                'value': format_round_notice_time(snapshot.slot_date, snapshot.round),
             },
             'thing7': {
                 'value': build_special_item_summary(special_names),
