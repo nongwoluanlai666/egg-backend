@@ -15,6 +15,7 @@ from wxcloudrun.merchant_notice import (
     MerchantNoticeConfigurationError,
     MerchantNoticePermissionError,
     MerchantNoticeSourceError,
+    broadcast_manual_message as broadcast_manual_merchant_notice,
     build_current_response as build_merchant_notice_current_response,
     run_guarded_watch_current_merchant,
     subscribe_next as subscribe_next_merchant_notice,
@@ -523,6 +524,35 @@ def internal_merchant_watch(request, _):
     return rsp
 
 
+def dev_merchant_notice_broadcast(request, _):
+    if request.method != 'POST':
+        rsp = json_response(-1, '请求方式错误', status=405)
+        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        return rsp
+
+    try:
+        require_dev_admin(request)
+        body = parse_json_body(request)
+        payload = parse_merchant_notice_broadcast_payload(body)
+        rsp = json_response(0, '', broadcast_manual_merchant_notice(payload))
+    except PermissionDeniedError as error:
+        rsp = json_response(40301, str(error), status=403)
+    except ServiceUnavailableError as error:
+        rsp = json_response(50301, str(error), status=503)
+    except MerchantNoticeConfigurationError as error:
+        rsp = json_response(50311, str(error), status=503)
+    except MerchantNoticeSourceError as error:
+        rsp = json_response(50211, str(error), status=502)
+    except ValidationError as error:
+        rsp = json_response(40001, str(error), status=400)
+    except Exception:
+        logger.exception('dev merchant notice broadcast unexpected error')
+        rsp = json_response(50014, '手动远行提醒发送失败，请稍后再试', status=500)
+
+    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    return rsp
+
+
 def get_count():
     try:
         data = Counters.objects.get(id=1)
@@ -730,6 +760,46 @@ def parse_predictor_config_payload(data):
         'artifact_uri': artifact_uri,
         'notes': notes,
         'config_json': json.dumps(config_data, ensure_ascii=False, sort_keys=True),
+    }
+
+
+def parse_merchant_notice_broadcast_payload(data):
+    message_data = data.get('data') if isinstance(data.get('data'), dict) else {}
+    date_text = normalize_text(data.get('date2') or message_data.get('date2'), 32)
+    thing_text = normalize_text(data.get('thing7') or message_data.get('thing7'), 64)
+    advice_text = normalize_text(data.get('thing10') or message_data.get('thing10'), 64)
+    page = normalize_text(data.get('page'), 255)
+    miniprogram_state = normalize_text(
+        data.get('miniprogramState') or data.get('miniprogram_state'),
+        16,
+    )
+    campaign_key = normalize_text(data.get('campaignKey') or data.get('campaign_key'), 64)
+    template_id = normalize_text(data.get('templateId') or data.get('template_id'), 128)
+
+    dry_run = False
+    if 'dryRun' in data:
+        dry_run = parse_boolean(data.get('dryRun'))
+    elif 'dry_run' in data:
+        dry_run = parse_boolean(data.get('dry_run'))
+
+    if not date_text:
+        raise ValidationError('缺少 date2')
+    if not thing_text:
+        raise ValidationError('缺少 thing7')
+    if not advice_text:
+        raise ValidationError('缺少 thing10')
+    if miniprogram_state and miniprogram_state not in {'developer', 'trial', 'formal'}:
+        raise ValidationError('miniprogramState 参数错误')
+
+    return {
+        'date2': date_text,
+        'thing7': thing_text,
+        'thing10': advice_text,
+        'page': page,
+        'miniprogramState': miniprogram_state,
+        'campaignKey': campaign_key,
+        'templateId': template_id,
+        'dryRun': dry_run,
     }
 
 

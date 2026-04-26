@@ -28,6 +28,12 @@ ROUND_START_HOURS = (8, 12, 16, 20)
 WECHAT_TOKEN_URL = 'https://api.weixin.qq.com/cgi-bin/token'
 WECHAT_SUBSCRIBE_SEND_URL = 'https://api.weixin.qq.com/cgi-bin/message/subscribe/send'
 WATCH_JOB_KEY = 'merchant_watch'
+MANUAL_SNAPSHOT_FINGERPRINT_PREFIX = 'manual-'
+SERVICE_REQUIRED_CONFIGS = (
+    ('WECHAT_APP_ID', '微信小程序 AppID'),
+    ('WECHAT_APP_SECRET', '微信小程序 AppSecret'),
+    ('MERCHANT_NOTIFY_TEMPLATE_ID', '订阅消息模板 ID'),
+)
 
 _CURRENT_PAYLOAD_CACHE = {
     'payload': None,
@@ -311,8 +317,11 @@ def serialize_snapshot(snapshot):
     }
 
 
-def get_latest_snapshot():
-    return MerchantSnapshot.objects.order_by('-slot_date', '-round', '-id').first()
+def get_latest_snapshot(include_manual=False):
+    queryset = MerchantSnapshot.objects.order_by('-slot_date', '-round', '-id')
+    if not include_manual:
+        queryset = queryset.exclude(fingerprint__startswith=MANUAL_SNAPSHOT_FINGERPRINT_PREFIX)
+    return queryset.first()
 
 
 def build_job_state_defaults(now, guard_seconds):
@@ -404,23 +413,23 @@ def build_subscription_state(record):
             'status': MerchantNoticeSubscription.STATUS_IDLE,
             'isActive': False,
             'buttonText': '开启下一次提醒',
-            'helperText': '命中特殊商品后会通知一次',
+            'helperText': '完成授权后，命中珍贵商品时会提醒您一次。',
             'subscribedAt': '',
             'consumedAt': '',
         }
 
     if record.status == MerchantNoticeSubscription.STATUS_ACTIVE:
         button_text = '已开启下一次提醒'
-        helper_text = '命中特殊商品后会通知一次'
+        helper_text = '已记录本次授权，命中珍贵商品时会提醒您一次。'
     elif record.status == MerchantNoticeSubscription.STATUS_CONSUMED:
         button_text = '重新开启下一次提醒'
-        helper_text = '上一次提醒已发送，可重新订阅'
+        helper_text = '上一次提醒已发送，回到蛋查查后可手动开启下一次提醒。'
     elif record.status == MerchantNoticeSubscription.STATUS_INVALID:
         button_text = '重新开启下一次提醒'
-        helper_text = '当前提醒已失效，请重新订阅'
+        helper_text = '当前提醒已失效，请重新授权订阅消息。'
     else:
         button_text = '开启下一次提醒'
-        helper_text = '命中特殊商品后会通知一次'
+        helper_text = '完成授权后，命中珍贵商品时会提醒您一次。'
 
     return {
         'status': record.status,
@@ -432,22 +441,64 @@ def build_subscription_state(record):
     }
 
 
+def get_notice_service_status():
+    missing_config_keys = []
+    missing_config_labels = []
+
+    for setting_key, display_label in SERVICE_REQUIRED_CONFIGS:
+        if not str(getattr(settings, setting_key, '') or '').strip():
+            missing_config_keys.append(setting_key)
+            missing_config_labels.append(display_label)
+
+    ready = not missing_config_keys
+    if ready:
+        message = '订阅提醒配置已就绪'
+    else:
+        message = f'缺少配置：{"、".join(missing_config_labels)}'
+
+    return {
+        'ready': ready,
+        'missingConfigKeys': missing_config_keys,
+        'missingConfigLabels': missing_config_labels,
+        'message': message,
+    }
+
+
 def get_notice_service_ready():
-    return bool(
-        str(getattr(settings, 'WECHAT_APP_ID', '') or '').strip()
-        and str(getattr(settings, 'WECHAT_APP_SECRET', '') or '').strip()
-        and str(getattr(settings, 'MERCHANT_NOTIFY_TEMPLATE_ID', '') or '').strip()
-    )
+    return get_notice_service_status()['ready']
+
+
+def sanitize_current_payload_for_client(payload):
+    sanitized_payload = copy.deepcopy(payload or {})
+    sanitized_items = []
+
+    for item in sanitized_payload.get('items') or []:
+        if not isinstance(item, dict):
+            continue
+        sanitized_item = dict(item)
+        sanitized_item.pop('image', None)
+        sanitized_items.append(sanitized_item)
+
+    sanitized_payload['items'] = sanitized_items
+    return sanitized_payload
 
 
 def build_current_response(openid=''):
     payload, is_fallback_data = get_current_payload_for_display()
+    payload = sanitize_current_payload_for_client(payload)
+    service_status = get_notice_service_status()
     subscription = None
     if openid:
         subscription = MerchantNoticeSubscription.objects.filter(openid=openid).first()
 
     return {
-        'serviceReady': get_notice_service_ready(),
+        'serviceReady': service_status['ready'],
+        'serviceStatus': service_status,
+        'serviceWarningText': (
+            ''
+            if service_status['ready']
+            else f'后台提醒配置尚未完成：{service_status["message"]}，请先补齐云托管环境变量并重新部署。'
+        ),
         'isFallbackData': bool(is_fallback_data),
         'specialKeywords': get_special_keywords(),
         'current': payload,
@@ -498,8 +549,9 @@ def get_or_create_subscription(openid, appid):
 
 
 def subscribe_next(openid, appid=''):
-    if not get_notice_service_ready():
-        raise MerchantNoticeConfigurationError('远行提醒未完成通知配置')
+    service_status = get_notice_service_status()
+    if not service_status['ready']:
+        raise MerchantNoticeConfigurationError(f'远行提醒未完成通知配置：{service_status["message"]}')
     normalized_openid = normalize_text(openid, 128)
     if not normalized_openid:
         raise MerchantNoticePermissionError('未获取到当前用户身份，暂时无法开启提醒')
@@ -596,11 +648,45 @@ def build_subscribe_message_body(subscription, snapshot):
     return body
 
 
+def build_manual_subscribe_message_body(subscription, payload):
+    template_id = normalize_text(
+        payload.get('templateId') or getattr(settings, 'MERCHANT_NOTIFY_TEMPLATE_ID', ''),
+        128,
+    )
+    body = {
+        'touser': subscription.openid,
+        'template_id': template_id,
+        'page': normalize_text(
+            payload.get('page') or getattr(settings, 'MERCHANT_NOTIFY_PAGE', 'pages/merchant-notice/index'),
+            255,
+        ),
+        'data': {
+            'date2': {
+                'value': normalize_text(payload.get('date2'), 32),
+            },
+            'thing7': {
+                'value': truncate_text(payload.get('thing7'), 20),
+            },
+            'thing10': {
+                'value': truncate_text(payload.get('thing10'), 20),
+            },
+        },
+        'lang': 'zh_CN',
+    }
+    miniprogram_state = normalize_text(
+        payload.get('miniprogramState') or getattr(settings, 'MERCHANT_NOTIFY_MINIPROGRAM_STATE', ''),
+        16,
+    )
+    if miniprogram_state:
+        body['miniprogram_state'] = miniprogram_state
+    return body
+
+
 def get_invalid_subscription_error_codes():
     return {'40003', '43101', '47003'}
 
 
-def send_subscribe_message(subscription, snapshot):
+def send_subscribe_message(subscription, snapshot, message_body=None, special_item_names=''):
     existing_log = MerchantNoticeSendLog.objects.filter(
         subscription=subscription,
         snapshot=snapshot,
@@ -611,12 +697,13 @@ def send_subscribe_message(subscription, snapshot):
             'reason': 'already_sent',
         }
 
+    request_payload = message_body or build_subscribe_message_body(subscription, snapshot)
     access_token = build_wechat_access_token()
     try:
         response = requests.post(
             WECHAT_SUBSCRIBE_SEND_URL,
             params={'access_token': access_token},
-            json=build_subscribe_message_body(subscription, snapshot),
+            json=request_payload,
             timeout=float(getattr(settings, 'MERCHANT_NOTIFY_FETCH_TIMEOUT_SECONDS', 8)),
         )
     except requests.RequestException as error:
@@ -630,19 +717,23 @@ def send_subscribe_message(subscription, snapshot):
     errcode = str(data.get('errcode', ''))
     errmsg = normalize_text(data.get('errmsg'), 255)
     msg_id = normalize_text(data.get('msgid') or data.get('msg_id'), 64)
-    special_item_names = snapshot.special_item_names
+    special_item_names = normalize_text(special_item_names or snapshot.special_item_names, 255)
+    template_id = normalize_text(
+        request_payload.get('template_id') or getattr(settings, 'MERCHANT_NOTIFY_TEMPLATE_ID', ''),
+        128,
+    )
     now = make_naive_local(get_local_now())
 
     if not existing_log:
         existing_log = MerchantNoticeSendLog(
             subscription=subscription,
             snapshot=snapshot,
-            template_id=normalize_text(getattr(settings, 'MERCHANT_NOTIFY_TEMPLATE_ID', ''), 128),
+            template_id=template_id,
             special_item_names=special_item_names,
             created_at=now,
         )
 
-    existing_log.template_id = normalize_text(getattr(settings, 'MERCHANT_NOTIFY_TEMPLATE_ID', ''), 128)
+    existing_log.template_id = template_id
     existing_log.special_item_names = special_item_names
     existing_log.msg_id = msg_id
     existing_log.error_code = errcode
@@ -715,6 +806,144 @@ def create_snapshot_from_payload(payload):
     return snapshot, created
 
 
+def resolve_manual_campaign_key(campaign_key=''):
+    normalized_key = normalize_text(campaign_key, 64)
+    if normalized_key:
+        return normalized_key
+    return f'manual-{format_iso_datetime(get_local_now())}-{time.time_ns()}'
+
+
+def build_manual_snapshot_fingerprint(campaign_key):
+    normalized_key = resolve_manual_campaign_key(campaign_key)
+    digest = hashlib.sha256(normalized_key.encode('utf-8')).hexdigest()
+    suffix_length = max(64 - len(MANUAL_SNAPSHOT_FINGERPRINT_PREFIX), 1)
+    return f'{MANUAL_SNAPSHOT_FINGERPRINT_PREFIX}{digest[:suffix_length]}'
+
+
+def get_manual_snapshot_defaults(payload):
+    now = make_naive_local(get_local_now())
+    base_snapshot = get_latest_snapshot(include_manual=False)
+    if base_snapshot:
+        slot_date = base_snapshot.slot_date
+        round_number = base_snapshot.round
+        total_rounds = base_snapshot.total_rounds
+        next_refresh_at = base_snapshot.next_refresh_at
+        items_json = base_snapshot.items_json
+    else:
+        slot_date = get_local_now().date()
+        round_number = 1
+        total_rounds = 1
+        next_refresh_at = None
+        items_json = '[]'
+
+    return {
+        'slot_date': slot_date,
+        'round': round_number,
+        'total_rounds': total_rounds,
+        'next_refresh_at': next_refresh_at,
+        'source_updated_at': normalize_text(payload.get('campaignKey') or 'manual_broadcast', 32),
+        'items_json': items_json,
+        'has_special_hit': True,
+        'special_item_names': normalize_text(payload.get('thing7'), 255),
+        'created_at': now,
+    }
+
+
+def get_or_create_manual_snapshot(payload, campaign_key=''):
+    fingerprint = build_manual_snapshot_fingerprint(campaign_key)
+    snapshot, created = MerchantSnapshot.objects.get_or_create(
+        fingerprint=fingerprint,
+        defaults=get_manual_snapshot_defaults(payload),
+    )
+    return snapshot, created
+
+
+def broadcast_manual_message(payload):
+    service_status = get_notice_service_status()
+    if not service_status['ready']:
+        raise MerchantNoticeConfigurationError(f'远行提醒未完成通知配置：{service_status["message"]}')
+
+    active_subscriptions = list(
+        MerchantNoticeSubscription.objects.filter(
+            status=MerchantNoticeSubscription.STATUS_ACTIVE,
+        ).order_by('id')
+    )
+
+    preview = build_manual_subscribe_message_body(type('PreviewSubscription', (), {'openid': 'preview'})(), payload)
+    preview.pop('touser', None)
+    campaign_key = resolve_manual_campaign_key(payload.get('campaignKey'))
+    snapshot_fingerprint = build_manual_snapshot_fingerprint(campaign_key)
+    target_count = len(active_subscriptions)
+
+    if payload.get('dryRun'):
+        return {
+            'dryRun': True,
+            'campaignKey': campaign_key,
+            'snapshotFingerprint': snapshot_fingerprint,
+            'targetCount': target_count,
+            'messagePreview': preview,
+        }
+
+    if target_count <= 0:
+        return {
+            'dryRun': False,
+            'created': False,
+            'campaignKey': campaign_key,
+            'snapshotFingerprint': snapshot_fingerprint,
+            'targetCount': 0,
+            'successCount': 0,
+            'failedCount': 0,
+            'skippedCount': 0,
+            'lastError': '',
+            'messagePreview': preview,
+        }
+
+    snapshot, created = get_or_create_manual_snapshot(payload, campaign_key=campaign_key)
+    success_count = 0
+    failed_count = 0
+    skipped_count = 0
+    last_error = ''
+
+    for subscription in active_subscriptions:
+        message_body = build_manual_subscribe_message_body(subscription, payload)
+        result = send_subscribe_message(
+            subscription,
+            snapshot,
+            message_body=message_body,
+            special_item_names=payload.get('thing7'),
+        )
+        if result['status'] == 'success':
+            success_count += 1
+        elif result['status'] == 'skipped':
+            skipped_count += 1
+        else:
+            failed_count += 1
+            last_error = result.get('errorMessage') or result.get('errorCode') or last_error
+
+    snapshot.notification_target_count = len(active_subscriptions)
+    snapshot.notification_success_count = success_count
+    if failed_count == 0:
+        snapshot.notification_dispatched_at = make_naive_local(get_local_now())
+    snapshot.save(update_fields=[
+        'notification_target_count',
+        'notification_success_count',
+        'notification_dispatched_at',
+    ])
+
+    return {
+        'dryRun': False,
+        'created': created,
+        'campaignKey': campaign_key,
+        'snapshotFingerprint': snapshot.fingerprint,
+        'targetCount': target_count,
+        'successCount': success_count,
+        'failedCount': failed_count,
+        'skippedCount': skipped_count,
+        'lastError': last_error,
+        'messagePreview': preview,
+    }
+
+
 def dispatch_snapshot_notifications(snapshot):
     if not snapshot.has_special_hit:
         return {
@@ -722,8 +951,9 @@ def dispatch_snapshot_notifications(snapshot):
             'targetCount': 0,
             'successCount': 0,
         }
-    if not get_notice_service_ready():
-        raise MerchantNoticeConfigurationError('远行提醒未完成通知配置')
+    service_status = get_notice_service_status()
+    if not service_status['ready']:
+        raise MerchantNoticeConfigurationError(f'远行提醒未完成通知配置：{service_status["message"]}')
 
     active_subscriptions = list(
         MerchantNoticeSubscription.objects.filter(
