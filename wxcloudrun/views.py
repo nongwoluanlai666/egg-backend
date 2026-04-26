@@ -11,6 +11,15 @@ from django.http import JsonResponse
 from django.shortcuts import render
 from django.utils import timezone
 
+from wxcloudrun.merchant_notice import (
+    MerchantNoticeConfigurationError,
+    MerchantNoticePermissionError,
+    MerchantNoticeSourceError,
+    build_current_response as build_merchant_notice_current_response,
+    run_guarded_watch_current_merchant,
+    subscribe_next as subscribe_next_merchant_notice,
+    verify_job_request,
+)
 from wxcloudrun.local_model_predict import (
     LocalModelPredictError,
     get_local_model_runtime_summary,
@@ -418,6 +427,102 @@ def dev_model_config(request, _):
     return rsp
 
 
+def merchant_notice_current(request, _):
+    if request.method != 'GET':
+        rsp = json_response(-1, '请求方式错误', status=405)
+        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        return rsp
+
+    try:
+        openid = get_header(request, 'X-WX-OPENID')
+        rsp = json_response(0, '', build_merchant_notice_current_response(openid=openid))
+    except MerchantNoticeConfigurationError as error:
+        rsp = json_response(50311, str(error), status=503)
+    except MerchantNoticeSourceError as error:
+        rsp = json_response(50211, str(error), status=502)
+    except Exception:
+        logger.exception('merchant notice current unexpected error')
+        rsp = json_response(50011, '远行提醒数据暂时不可用，请稍后再试', status=500)
+
+    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    return rsp
+
+
+def merchant_notice_subscribe_next(request, _):
+    if request.method != 'POST':
+        rsp = json_response(-1, '请求方式错误', status=405)
+        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        return rsp
+
+    try:
+        parse_json_body(request)
+        openid = get_header(request, 'X-WX-OPENID')
+        appid = get_header(request, 'X-WX-APPID')
+        rsp = json_response(0, '', subscribe_next_merchant_notice(openid=openid, appid=appid))
+    except ValidationError as error:
+        rsp = json_response(40001, str(error), status=400)
+    except MerchantNoticePermissionError as error:
+        rsp = json_response(40111, str(error), status=401)
+    except MerchantNoticeConfigurationError as error:
+        rsp = json_response(50311, str(error), status=503)
+    except Exception:
+        logger.exception('merchant notice subscribe unexpected error')
+        rsp = json_response(50012, '开启远行提醒失败，请稍后再试', status=500)
+
+    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    return rsp
+
+
+def internal_merchant_watch(request, _):
+    if request.method not in {'GET', 'POST'}:
+        rsp = json_response(-1, '请求方式错误', status=405)
+        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        return rsp
+
+    try:
+        request_data = request.GET if request.method == 'GET' else parse_json_body(request)
+        verify_job_request(
+            request_data.get('token') or get_header(request, 'X-MERCHANT-JOB-TOKEN'),
+            get_request_ip(request),
+        )
+        timeout_seconds = parse_float_field(
+            request_data.get('timeoutSeconds', getattr(settings, 'MERCHANT_NOTIFY_POLL_TIMEOUT_SECONDS', 900)),
+            'timeoutSeconds',
+            minimum=10,
+            maximum=3600,
+        )
+        poll_interval_seconds = parse_float_field(
+            request_data.get('pollIntervalSeconds', getattr(settings, 'MERCHANT_NOTIFY_POLL_INTERVAL_SECONDS', 30)),
+            'pollIntervalSeconds',
+            minimum=1,
+            maximum=300,
+        )
+        force = parse_boolean(request_data.get('force')) if 'force' in request_data else False
+        rsp = json_response(
+            0,
+            '',
+            run_guarded_watch_current_merchant(
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+                force=force,
+            ),
+        )
+    except MerchantNoticePermissionError as error:
+        rsp = json_response(40311, str(error), status=403)
+    except MerchantNoticeConfigurationError as error:
+        rsp = json_response(50311, str(error), status=503)
+    except MerchantNoticeSourceError as error:
+        rsp = json_response(50211, str(error), status=502)
+    except ValidationError as error:
+        rsp = json_response(40001, str(error), status=400)
+    except Exception:
+        logger.exception('internal merchant watch unexpected error')
+        rsp = json_response(50013, '远行提醒任务执行失败', status=500)
+
+    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    return rsp
+
+
 def get_count():
     try:
         data = Counters.objects.get(id=1)
@@ -655,6 +760,19 @@ def parse_int_field(value, label, minimum=None, maximum=None):
     if maximum is not None and int_value > maximum:
         raise ValidationError(f'{label} 参数超出允许范围')
     return int_value
+
+
+def parse_float_field(value, label, minimum=None, maximum=None):
+    try:
+        float_value = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValidationError(f'{label} 参数格式错误') from error
+
+    if minimum is not None and float_value < minimum:
+        raise ValidationError(f'{label} 参数超出允许范围')
+    if maximum is not None and float_value > maximum:
+        raise ValidationError(f'{label} 参数超出允许范围')
+    return float_value
 
 
 def parse_boolean(value):

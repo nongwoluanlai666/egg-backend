@@ -211,6 +211,20 @@ def parse_env_bool(name, default='false'):
     return str(os.environ.get(name, default)).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
 
 
+def parse_env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def parse_env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
 EGG_MODEL_ARTIFACT_URI = os.environ.get('EGG_MODEL_ARTIFACT_URI', '').strip()
 EGG_MODEL_DEFAULT_RELATIVE_PATH = os.environ.get(
     'EGG_MODEL_DEFAULT_RELATIVE_PATH',
@@ -226,3 +240,42 @@ try:
     EGG_MODEL_TOP_K = int(os.environ.get('EGG_MODEL_TOP_K', '10'))
 except (TypeError, ValueError):
     EGG_MODEL_TOP_K = 10
+
+WECHAT_APP_ID = os.environ.get('WECHAT_APP_ID', os.environ.get('WXA_APPID', '')).strip()
+WECHAT_APP_SECRET = os.environ.get('WECHAT_APP_SECRET', os.environ.get('WXA_APPSECRET', '')).strip()
+
+MERCHANT_NOTICE_TIMEZONE = os.environ.get('MERCHANT_NOTICE_TIMEZONE', 'Asia/Shanghai').strip() or 'Asia/Shanghai'
+MERCHANT_SOURCE_URL = os.environ.get(
+    'MERCHANT_SOURCE_URL',
+    'https://roco-eggs.tsuki-world.com/api/merchant/current',
+).strip()
+MERCHANT_SOURCE_REFERER = os.environ.get(
+    'MERCHANT_SOURCE_REFERER',
+    'https://roco-eggs.tsuki-world.com/forum',
+).strip()
+MERCHANT_SOURCE_USER_AGENT = os.environ.get(
+    'MERCHANT_SOURCE_USER_AGENT',
+    (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+        '(KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36'
+    ),
+).strip()
+MERCHANT_NOTIFY_TEMPLATE_ID = os.environ.get(
+    'MERCHANT_NOTIFY_TEMPLATE_ID',
+    'NA9mVDvFObzNcV9QbXJbUfyoRw_XAw0fLYd8TvIKNpo',
+).strip()
+MERCHANT_NOTIFY_PAGE = os.environ.get(
+    'MERCHANT_NOTIFY_PAGE',
+    'pages/merchant-notice/index?from=notify',
+).strip()
+MERCHANT_NOTIFY_SPECIAL_KEYWORDS = os.environ.get(
+    'MERCHANT_NOTIFY_SPECIAL_KEYWORDS',
+    '炫彩,棱镜球,同乘,祝福项坠',
+).strip()
+MERCHANT_NOTIFY_JOB_TOKEN = os.environ.get('MERCHANT_NOTIFY_JOB_TOKEN', '').strip()
+MERCHANT_NOTIFY_MINIPROGRAM_STATE = os.environ.get('MERCHANT_NOTIFY_MINIPROGRAM_STATE', '').strip()
+MERCHANT_NOTIFY_FETCH_TIMEOUT_SECONDS = parse_env_float('MERCHANT_NOTIFY_FETCH_TIMEOUT_SECONDS', '8')
+MERCHANT_NOTIFY_POLL_INTERVAL_SECONDS = parse_env_float('MERCHANT_NOTIFY_POLL_INTERVAL_SECONDS', '30')
+MERCHANT_NOTIFY_POLL_TIMEOUT_SECONDS = parse_env_float('MERCHANT_NOTIFY_POLL_TIMEOUT_SECONDS', '900')
+MERCHANT_NOTIFY_TRIGGER_GUARD_SECONDS = parse_env_int('MERCHANT_NOTIFY_TRIGGER_GUARD_SECONDS', '1800')
+MERCHANT_NOTICE_CACHE_TTL_SECONDS = parse_env_int('MERCHANT_NOTICE_CACHE_TTL_SECONDS', '30')

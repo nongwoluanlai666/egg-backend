@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates cron curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
@@ -17,6 +17,9 @@ RUN pip install --upgrade pip \
 
 COPY . /app
 
+RUN chmod +x /app/start.sh /app/task.sh \
+    && crontab /app/task.txt
+
 EXPOSE 80
 
-CMD ["sh", "-c", "python manage.py migrate --noinput && python manage.py runserver 0.0.0.0:80"]
+ENTRYPOINT ["sh", "/app/start.sh"]
