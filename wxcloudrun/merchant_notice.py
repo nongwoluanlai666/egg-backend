@@ -581,6 +581,7 @@ def build_wechat_access_token():
                 'secret': secret,
             },
             timeout=float(getattr(settings, 'MERCHANT_NOTIFY_FETCH_TIMEOUT_SECONDS', 8)),
+            verify=False,
         )
     except requests.RequestException as error:
         raise MerchantNoticeSourceError(f'微信 access_token 获取失败: {error}') from error
@@ -705,6 +706,7 @@ def send_subscribe_message(subscription, snapshot, message_body=None, special_it
             params={'access_token': access_token},
             json=request_payload,
             timeout=float(getattr(settings, 'MERCHANT_NOTIFY_FETCH_TIMEOUT_SECONDS', 8)),
+            verify=False,
         )
     except requests.RequestException as error:
         raise MerchantNoticeSourceError(f'微信订阅消息发送失败: {error}') from error
