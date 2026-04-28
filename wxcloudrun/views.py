@@ -546,13 +546,17 @@ def merchant_notice_dev_self_test(request, _):
         return rsp
 
     try:
-        parse_json_body(request)
+        body = parse_json_body(request)
         openid = get_header(request, 'X-WX-OPENID')
         appid = get_header(request, 'X-WX-APPID')
         rsp = json_response(
             0,
             '',
-            send_dev_self_test_merchant_notice(openid=openid, appid=appid),
+            send_dev_self_test_merchant_notice(
+                openid=openid,
+                appid=appid,
+                env_version=body.get('envVersion'),
+            ),
         )
     except ValidationError as error:
         rsp = json_response(40001, str(error), status=400)

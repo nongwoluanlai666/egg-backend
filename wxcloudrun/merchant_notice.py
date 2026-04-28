@@ -25,9 +25,9 @@ logger = logging.getLogger('log')
 
 DEFAULT_SPECIAL_KEYWORDS = ('炫彩', '棱镜球', '同乘', '祝福项坠')
 DEFAULT_SELECTED_GOODS = ('炫彩蛋', '棱镜球', '祝福项坠', '黑白炫彩蛋', '赛季炫彩蛋')
-DEFAULT_NOTICE_ADVICE = '建议点击打开蛋查查，并开启下次提醒'
+DEFAULT_NOTICE_ACTION = '打开蛋查查看'
 DEV_SELF_TEST_ITEM_NAMES = ('炫彩蛋', '棱镜球')
-DEV_SELF_TEST_ADVICE = '开发模式测试通知，请返回蛋查查查看'
+DEV_SELF_TEST_ACTION = '返回蛋查查看'
 ROUND_START_HOURS = (8, 12, 16, 20)
 MERCHANT_SOURCE_PRIMARY = 'primary'
 MERCHANT_SOURCE_BACKUP = 'backup'
@@ -844,7 +844,7 @@ def build_subscription_state(record):
             'status': MerchantNoticeSubscription.STATUS_IDLE,
             'isActive': False,
             'buttonText': '订阅提醒(剩0次)',
-            'helperText': '每次完成授权都会累计 1 次提醒机会。',
+            'helperText': '每次授权可增加1次提醒。',
             'subscribedAt': '',
             'consumedAt': '',
             'pendingCount': 0,
@@ -856,19 +856,19 @@ def build_subscription_state(record):
     if pending_count > 0:
         effective_status = MerchantNoticeSubscription.STATUS_ACTIVE
         button_text = f'订阅提醒(剩{pending_count}次)'
-        helper_text = f'当前剩余 {pending_count} 次提醒机会，命中已选商品时会消耗 1 次。'
+        helper_text = ''
     elif record.status == MerchantNoticeSubscription.STATUS_CONSUMED or notify_count > 0:
         effective_status = MerchantNoticeSubscription.STATUS_CONSUMED
         button_text = '订阅提醒(剩0次)'
-        helper_text = '上一次提醒已发送完毕，可继续追加新的提醒次数。'
+        helper_text = '上次已发完，可继续追加。'
     elif record.status == MerchantNoticeSubscription.STATUS_INVALID:
         effective_status = MerchantNoticeSubscription.STATUS_INVALID
         button_text = '订阅提醒(剩0次)'
-        helper_text = '当前提醒已失效，请重新授权订阅消息。'
+        helper_text = '提醒已失效，请重新授权。'
     else:
         effective_status = MerchantNoticeSubscription.STATUS_IDLE
         button_text = '订阅提醒(剩0次)'
-        helper_text = '每次完成授权都会累计 1 次提醒机会。'
+        helper_text = '每次授权可增加1次提醒。'
 
     return {
         'status': effective_status,
@@ -1102,22 +1102,31 @@ def subscribe_next(openid, appid=''):
     }
 
 
-def build_dev_self_test_payload():
+def resolve_dev_self_test_miniprogram_state(env_version=''):
+    normalized_env_version = normalize_text(env_version, 16)
+    if normalized_env_version == 'trial':
+        return 'trial'
+    if normalized_env_version in {'release', 'formal'}:
+        return 'formal'
+    return 'developer'
+
+
+def build_dev_self_test_payload(env_version='', remaining_count=0):
     now = get_local_now()
     return {
         'date2': now.strftime('%m-%d %H:%M'),
         'thing7': build_special_item_summary(DEV_SELF_TEST_ITEM_NAMES),
-        'thing10': truncate_text(DEV_SELF_TEST_ADVICE, 20),
+        'thing10': build_notice_advice_text(DEV_SELF_TEST_ACTION, remaining_count),
         'page': normalize_text(
             getattr(settings, 'MERCHANT_NOTIFY_PAGE', 'pages/merchant-notice/index'),
             255,
         ),
-        'miniprogramState': 'developer',
+        'miniprogramState': resolve_dev_self_test_miniprogram_state(env_version),
         'campaignKey': f'dev-self-test-{format_iso_datetime(now)}-{time.time_ns()}',
     }
 
 
-def send_dev_self_test_message(openid, appid=''):
+def send_dev_self_test_message(openid, appid='', env_version=''):
     service_status = get_notice_service_status()
     if not service_status['ready']:
         raise MerchantNoticeConfigurationError(f'远行提醒未完成通知配置：{service_status["message"]}')
@@ -1142,7 +1151,10 @@ def send_dev_self_test_message(openid, appid=''):
     if subscription.status == MerchantNoticeSubscription.STATUS_INVALID:
         raise MerchantNoticeValidationError('当前提醒已失效，请重新授权订阅消息后再测试')
 
-    payload = build_dev_self_test_payload()
+    payload = build_dev_self_test_payload(
+        env_version=env_version,
+        remaining_count=max(get_subscription_pending_count(subscription) - 1, 0),
+    )
     snapshot, _snapshot_created = get_or_create_manual_snapshot(
         payload,
         campaign_key=payload['campaignKey'],
@@ -1251,6 +1263,14 @@ def truncate_text(value, max_length):
     return text[:max_length]
 
 
+def build_notice_advice_text(action_text, remaining_count):
+    action = normalize_text(action_text, 12) or DEFAULT_NOTICE_ACTION
+    remaining = max(parse_int(remaining_count, 0), 0)
+    if remaining > 0:
+        return truncate_text(f'{action}，剩{remaining}次提醒', 20)
+    return truncate_text(f'{action}，可再订阅', 20)
+
+
 def build_special_item_summary(names):
     normalized_names = [normalize_text(name, 20) for name in names if normalize_text(name, 20)]
     if not normalized_names:
@@ -1322,6 +1342,7 @@ def count_snapshot_dispatch_targets(snapshot):
 
 def build_subscribe_message_body(subscription, snapshot, matched_item_names=None):
     special_names = normalize_message_item_names(snapshot, matched_item_names)
+    remaining_count = max(get_subscription_pending_count(subscription) - 1, 0)
     body = {
         'touser': subscription.openid,
         'template_id': str(getattr(settings, 'MERCHANT_NOTIFY_TEMPLATE_ID', '') or '').strip(),
@@ -1334,7 +1355,7 @@ def build_subscribe_message_body(subscription, snapshot, matched_item_names=None
                 'value': build_special_item_summary(special_names),
             },
             'thing10': {
-                'value': truncate_text(DEFAULT_NOTICE_ADVICE, 20),
+                'value': build_notice_advice_text(DEFAULT_NOTICE_ACTION, remaining_count),
             },
         },
         'lang': 'zh_CN',
