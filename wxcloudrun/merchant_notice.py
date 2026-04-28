@@ -25,9 +25,9 @@ logger = logging.getLogger('log')
 
 DEFAULT_SPECIAL_KEYWORDS = ('炫彩', '棱镜球', '同乘', '祝福项坠')
 DEFAULT_SELECTED_GOODS = ('炫彩蛋', '棱镜球', '祝福项坠', '黑白炫彩蛋', '赛季炫彩蛋')
-DEFAULT_NOTICE_ACTION = '打开蛋查查看'
+DEFAULT_NOTICE_ACTION = '打开蛋查查'
 DEV_SELF_TEST_ITEM_NAMES = ('炫彩蛋', '棱镜球')
-DEV_SELF_TEST_ACTION = '返回蛋查查看'
+DEV_SELF_TEST_ACTION = '返回蛋查查'
 ROUND_START_HOURS = (8, 12, 16, 20)
 MERCHANT_SOURCE_PRIMARY = 'primary'
 MERCHANT_SOURCE_BACKUP = 'backup'
