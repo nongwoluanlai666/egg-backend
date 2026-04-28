@@ -182,6 +182,11 @@ class MerchantNoticeSubscription(models.Model):
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_IDLE, db_index=True)
     subscribed_at = models.DateTimeField(default=timezone.now, db_index=True)
     consumed_at = models.DateTimeField(null=True, blank=True)
+    pending_count = models.PositiveIntegerField(default=0)
+    daily_increment_date = models.DateField(null=True, blank=True)
+    daily_increment_count = models.PositiveIntegerField(default=0)
+    daily_reward_unlock_count = models.PositiveIntegerField(default=0)
+    selected_goods_json = models.TextField(default='[]', blank=True)
     last_notified_snapshot = models.ForeignKey(
         MerchantSnapshot,
         null=True,
@@ -203,6 +208,60 @@ class MerchantNoticeSubscription(models.Model):
         indexes = [
             models.Index(fields=['status', 'subscribed_at'], name='mnotice_active_idx'),
             models.Index(fields=['openid_hash', 'updated_at'], name='mnotice_hash_idx'),
+        ]
+
+
+class MerchantNoticeDispatchJob(models.Model):
+    JOB_TYPE_SNAPSHOT = 'snapshot'
+    JOB_TYPE_MANUAL = 'manual'
+    JOB_TYPE_CHOICES = (
+        (JOB_TYPE_SNAPSHOT, 'Snapshot'),
+        (JOB_TYPE_MANUAL, 'Manual'),
+    )
+
+    STATUS_PENDING = 'pending'
+    STATUS_RUNNING = 'running'
+    STATUS_COMPLETED = 'completed'
+    STATUS_PARTIAL_FAILED = 'partial_failed'
+    STATUS_FAILED = 'failed'
+    STATUS_CHOICES = (
+        (STATUS_PENDING, 'Pending'),
+        (STATUS_RUNNING, 'Running'),
+        (STATUS_COMPLETED, 'Completed'),
+        (STATUS_PARTIAL_FAILED, 'Partial Failed'),
+        (STATUS_FAILED, 'Failed'),
+    )
+
+    id = models.BigAutoField(primary_key=True)
+    job_key = models.CharField(max_length=96, unique=True)
+    job_type = models.CharField(max_length=16, choices=JOB_TYPE_CHOICES, default=JOB_TYPE_SNAPSHOT, db_index=True)
+    snapshot = models.ForeignKey(
+        MerchantSnapshot,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name='dispatch_jobs',
+    )
+    status = models.CharField(max_length=24, choices=STATUS_CHOICES, default=STATUS_PENDING, db_index=True)
+    payload_json = models.TextField(default='{}', blank=True)
+    target_count = models.PositiveIntegerField(default=0)
+    success_count = models.PositiveIntegerField(default=0)
+    failed_count = models.PositiveIntegerField(default=0)
+    skipped_count = models.PositiveIntegerField(default=0)
+    last_error = models.CharField(max_length=255, blank=True, default='')
+    started_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f'{self.job_key} ({self.status})'
+
+    class Meta:
+        db_table = 'MerchantNoticeDispatchJob'
+        indexes = [
+            models.Index(fields=['status', 'created_at'], name='mnotice_dispatch_idx'),
+            models.Index(fields=['job_type', 'updated_at'], name='mnotice_dispatch_type_idx'),
         ]
 
 

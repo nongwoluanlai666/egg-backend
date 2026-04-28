@@ -13,6 +13,7 @@ from django.conf import settings
 from django.db import transaction
 
 from wxcloudrun.models import (
+    MerchantNoticeDispatchJob,
     MerchantNoticeJobState,
     MerchantNoticeSendLog,
     MerchantNoticeSubscription,
@@ -23,12 +24,19 @@ from wxcloudrun.models import (
 logger = logging.getLogger('log')
 
 DEFAULT_SPECIAL_KEYWORDS = ('炫彩', '棱镜球', '同乘', '祝福项坠')
+DEFAULT_SELECTED_GOODS = ('炫彩蛋', '棱镜球', '祝福项坠', '黑白炫彩蛋', '赛季炫彩蛋')
 DEFAULT_NOTICE_ADVICE = '建议点击打开蛋查查，并开启下次提醒'
+DEV_SELF_TEST_ITEM_NAMES = ('炫彩蛋', '棱镜球')
+DEV_SELF_TEST_ADVICE = '开发模式测试通知，请返回蛋查查查看'
 ROUND_START_HOURS = (8, 12, 16, 20)
+MERCHANT_SOURCE_PRIMARY = 'primary'
+MERCHANT_SOURCE_BACKUP = 'backup'
 WECHAT_TOKEN_URL = 'https://api.weixin.qq.com/cgi-bin/token'
 WECHAT_SUBSCRIBE_SEND_URL = 'https://api.weixin.qq.com/cgi-bin/message/subscribe/send'
 WATCH_JOB_KEY = 'merchant_watch'
 MANUAL_SNAPSHOT_FINGERPRINT_PREFIX = 'manual-'
+SNAPSHOT_DISPATCH_JOB_PREFIX = 'snapshot:'
+MANUAL_DISPATCH_JOB_PREFIX = 'manual:'
 SERVICE_REQUIRED_CONFIGS = (
     ('WECHAT_APP_ID', '微信小程序 AppID'),
     ('WECHAT_APP_SECRET', '微信小程序 AppSecret'),
@@ -54,6 +62,10 @@ class MerchantNoticeConfigurationError(MerchantNoticeError):
 
 
 class MerchantNoticePermissionError(MerchantNoticeError):
+    pass
+
+
+class MerchantNoticeValidationError(MerchantNoticeError):
     pass
 
 
@@ -119,6 +131,10 @@ def get_trigger_guard_seconds():
     return max(parse_int(getattr(settings, 'MERCHANT_NOTIFY_TRIGGER_GUARD_SECONDS', 1800), 1800), 0)
 
 
+def get_rewarded_increment_step():
+    return max(parse_int(getattr(settings, 'MERCHANT_NOTICE_DAILY_REWARDED_STEP', 30), 30), 1)
+
+
 def get_special_keywords():
     raw = str(getattr(settings, 'MERCHANT_NOTIFY_SPECIAL_KEYWORDS', '') or '').strip()
     if not raw:
@@ -132,9 +148,76 @@ def get_special_keywords():
     return keywords or list(DEFAULT_SPECIAL_KEYWORDS)
 
 
+def normalize_goods_name(value):
+    return normalize_text(value, 64)
+
+
+def dedupe_goods_names(items):
+    results = []
+    seen = set()
+    for item in items or []:
+        normalized = normalize_goods_name(item)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        results.append(normalized)
+    return results
+
+
+def get_default_selected_goods():
+    raw = str(getattr(settings, 'MERCHANT_NOTIFY_DEFAULT_SELECTED_GOODS', '') or '').strip()
+    if not raw:
+        return list(DEFAULT_SELECTED_GOODS)
+
+    return dedupe_goods_names(raw.replace('，', ',').split(',')) or list(DEFAULT_SELECTED_GOODS)
+
+
+def serialize_goods_names(items):
+    return json.dumps(dedupe_goods_names(items), ensure_ascii=False)
+
+
+def parse_selected_goods_value(value):
+    if value in (None, ''):
+        return []
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith('['):
+            try:
+                parsed = json.loads(text)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed = []
+        else:
+            parsed = text.replace('，', ',').split(',')
+    elif isinstance(value, (list, tuple, set)):
+        parsed = list(value)
+    else:
+        parsed = []
+
+    return dedupe_goods_names(parsed)
+
+
 def has_special_keyword(name):
     item_name = normalize_text(name, 64)
     return any(keyword in item_name for keyword in get_special_keywords())
+
+
+def get_merchant_source_priority_list():
+    raw = str(getattr(settings, 'MERCHANT_SOURCE_PRIORITY', '') or '').strip()
+    if not raw:
+        raw = f'{MERCHANT_SOURCE_PRIMARY},{MERCHANT_SOURCE_BACKUP}'
+
+    source_names = []
+    for item in raw.replace('，', ',').split(','):
+        normalized = normalize_text(item, 32).lower()
+        if normalized in {MERCHANT_SOURCE_PRIMARY, MERCHANT_SOURCE_BACKUP} and normalized not in source_names:
+            source_names.append(normalized)
+
+    if not source_names:
+        return [MERCHANT_SOURCE_PRIMARY, MERCHANT_SOURCE_BACKUP]
+    return source_names
 
 
 def build_absolute_image_url(path):
@@ -220,7 +303,7 @@ def normalize_source_item(item):
     }
 
 
-def normalize_source_payload(raw_payload):
+def normalize_primary_source_payload(raw_payload):
     slot_date = parse_slot_date(raw_payload.get('slot_date'))
     round_number = max(parse_int(raw_payload.get('round'), 1), 1)
     total_rounds = max(parse_int(raw_payload.get('total_rounds'), 4), 1)
@@ -254,7 +337,164 @@ def normalize_source_payload(raw_payload):
     }
 
 
-def build_source_headers():
+def parse_backup_timestamp_ms(value):
+    try:
+        timestamp_ms = int(value)
+    except (TypeError, ValueError):
+        return None
+    if timestamp_ms <= 0:
+        return None
+    return datetime.fromtimestamp(timestamp_ms / 1000, tz=get_local_timezone())
+
+
+def normalize_backup_source_item(item):
+    name = normalize_text(item.get('name'), 64)
+    is_special = has_special_keyword(name)
+    start_at = parse_backup_timestamp_ms(item.get('start_time'))
+    end_at = parse_backup_timestamp_ms(item.get('end_time'))
+    return {
+        'name': name,
+        'image': build_absolute_image_url(item.get('icon_url')),
+        'price': 0,
+        'purchaseLimit': 0,
+        'isSpecial': is_special,
+        'isHighlight': bool(is_special),
+        'sourceHighlight': False,
+        'startAt': start_at,
+        'endAt': end_at,
+    }
+
+
+def find_backup_merchant_activity(raw_payload):
+    data = raw_payload.get('data') if isinstance(raw_payload.get('data'), dict) else {}
+    activities = data.get('merchantActivities') or []
+    if not isinstance(activities, list):
+        return {}
+
+    for activity in activities:
+        if isinstance(activity, dict) and normalize_text(activity.get('name'), 32) == '远行商人':
+            return activity
+
+    for activity in activities:
+        if isinstance(activity, dict):
+            return activity
+    return {}
+
+
+def infer_round_number_from_start(start_at, slot_date):
+    if start_at:
+        for round_number in range(1, len(ROUND_START_HOURS) + 1):
+            round_start_at, _ = build_round_window(slot_date, round_number)
+            if int(abs((start_at - round_start_at).total_seconds())) <= 60:
+                return round_number
+
+    now = start_at or get_local_now()
+    for round_number in range(1, len(ROUND_START_HOURS) + 1):
+        round_start_at, round_end_at = build_round_window(slot_date, round_number)
+        if round_start_at <= now < round_end_at:
+            return round_number
+    if now < build_round_window(slot_date, 1)[0]:
+        return 1
+    return len(ROUND_START_HOURS)
+
+
+def select_backup_round_items(normalized_items, slot_date):
+    now = get_local_now()
+    all_round_items = [
+        item for item in normalized_items
+        if not item.get('startAt') and not item.get('endAt')
+    ]
+    timed_items = [
+        item for item in normalized_items
+        if item.get('startAt')
+    ]
+
+    active_timed_items = [
+        item for item in timed_items
+        if item['startAt'] <= now and (not item.get('endAt') or now < item['endAt'])
+    ]
+    if active_timed_items:
+        selected_start_at = max(item['startAt'] for item in active_timed_items)
+        selected_items = [
+            item for item in active_timed_items
+            if item['startAt'] == selected_start_at
+        ]
+        return selected_start_at, all_round_items + selected_items
+
+    future_timed_items = [
+        item for item in timed_items
+        if item['startAt'] > now
+    ]
+    if future_timed_items:
+        selected_start_at = min(item['startAt'] for item in future_timed_items)
+        selected_items = [
+            item for item in future_timed_items
+            if item['startAt'] == selected_start_at
+        ]
+        return selected_start_at, all_round_items + selected_items
+
+    if timed_items:
+        selected_start_at = max(item['startAt'] for item in timed_items)
+        selected_items = [
+            item for item in timed_items
+            if item['startAt'] == selected_start_at
+        ]
+        return selected_start_at, all_round_items + selected_items
+
+    return None, all_round_items
+
+
+def normalize_backup_source_payload(raw_payload):
+    if parse_int(raw_payload.get('code'), -1) != 0:
+        raise MerchantNoticeSourceError(f'远行商人备用源返回异常: {raw_payload}')
+
+    activity = find_backup_merchant_activity(raw_payload)
+    if not activity:
+        raise MerchantNoticeSourceError('远行商人备用源未返回 merchantActivities.远行商人 数据')
+
+    slot_date = parse_slot_date(activity.get('start_date'))
+    normalized_items = [
+        normalize_backup_source_item(item)
+        for item in (activity.get('get_props') or [])
+        if isinstance(item, dict) and normalize_text(item.get('name'), 64)
+    ]
+    selected_start_at, selected_items = select_backup_round_items(normalized_items, slot_date)
+    round_number = infer_round_number_from_start(selected_start_at, slot_date)
+    total_rounds = len(ROUND_START_HOURS)
+    _, next_refresh_at = build_round_window(slot_date, round_number)
+    source_updated_at = parse_backup_timestamp_ms(activity.get('created_at')) or get_local_now()
+    items = []
+    for item in selected_items:
+        normalized_item = dict(item)
+        normalized_item.pop('startAt', None)
+        normalized_item.pop('endAt', None)
+        items.append(normalized_item)
+
+    special_item_names = [item['name'] for item in items if item['isSpecial']]
+    fingerprint = compute_payload_fingerprint({
+        'slotDate': slot_date.isoformat(),
+        'round': round_number,
+        'totalRounds': total_rounds,
+        'items': items,
+    })
+
+    return {
+        'slotDate': slot_date.isoformat(),
+        'round': round_number,
+        'totalRounds': total_rounds,
+        'roundLabel': format_round_label(round_number, total_rounds),
+        'timeWindowLabel': format_round_window(slot_date, round_number),
+        'nextRefreshAt': format_iso_datetime(next_refresh_at),
+        'nextRefreshLabel': format_next_refresh_label(next_refresh_at),
+        'sourceUpdatedAt': normalize_text(source_updated_at.strftime('%Y-%m-%d %H:%M:%S'), 32),
+        'items': items,
+        'hasSpecialHit': bool(special_item_names),
+        'specialItemNames': special_item_names,
+        'fingerprint': fingerprint,
+    }
+
+
+def build_primary_source_headers():
     return {
         'Accept': 'application/json,text/plain,*/*',
         'Referer': str(getattr(settings, 'MERCHANT_SOURCE_REFERER', '') or '').strip(),
@@ -264,32 +504,87 @@ def build_source_headers():
     }
 
 
+def build_backup_source_headers():
+    return {
+        'Accept': 'application/json,text/plain,*/*',
+        'Referer': str(getattr(settings, 'MERCHANT_BACKUP_SOURCE_REFERER', '') or '').strip(),
+        'User-Agent': str(getattr(settings, 'MERCHANT_SOURCE_USER_AGENT', '') or '').strip(),
+        'X-API-Key': str(getattr(settings, 'MERCHANT_BACKUP_SOURCE_API_KEY', '') or '').strip(),
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+    }
+
+
+def fetch_primary_source_payload():
+    try:
+        response = requests.get(
+            settings.MERCHANT_SOURCE_URL,
+            headers=build_primary_source_headers(),
+            timeout=float(getattr(settings, 'MERCHANT_NOTIFY_FETCH_TIMEOUT_SECONDS', 8)),
+        )
+    except requests.RequestException as error:
+        raise MerchantNoticeSourceError(f'远行商人主源请求失败: {error}') from error
+
+    if response.status_code < 200 or response.status_code >= 300:
+        raise MerchantNoticeSourceError(f'远行商人主源返回异常状态码: {response.status_code}')
+
+    try:
+        raw_payload = response.json()
+    except ValueError as error:
+        raise MerchantNoticeSourceError('远行商人主源返回了非 JSON 数据') from error
+
+    return normalize_primary_source_payload(raw_payload if isinstance(raw_payload, dict) else {})
+
+
+def fetch_backup_source_payload():
+    api_key = str(getattr(settings, 'MERCHANT_BACKUP_SOURCE_API_KEY', '') or '').strip()
+    if not api_key:
+        raise MerchantNoticeSourceError('远行商人备用源未配置 MERCHANT_BACKUP_SOURCE_API_KEY')
+
+    try:
+        response = requests.get(
+            settings.MERCHANT_BACKUP_SOURCE_URL,
+            headers=build_backup_source_headers(),
+            timeout=float(getattr(settings, 'MERCHANT_NOTIFY_FETCH_TIMEOUT_SECONDS', 8)),
+        )
+    except requests.RequestException as error:
+        raise MerchantNoticeSourceError(f'远行商人备用源请求失败: {error}') from error
+
+    if response.status_code < 200 or response.status_code >= 300:
+        raise MerchantNoticeSourceError(f'远行商人备用源返回异常状态码: {response.status_code}')
+
+    try:
+        raw_payload = response.json()
+    except ValueError as error:
+        raise MerchantNoticeSourceError('远行商人备用源返回了非 JSON 数据') from error
+
+    return normalize_backup_source_payload(raw_payload if isinstance(raw_payload, dict) else {})
+
+
+def fetch_source_payload_from_priority(source_name):
+    if source_name == MERCHANT_SOURCE_PRIMARY:
+        return fetch_primary_source_payload()
+    if source_name == MERCHANT_SOURCE_BACKUP:
+        return fetch_backup_source_payload()
+    raise MerchantNoticeSourceError(f'未知的远行商人数据源: {source_name}')
+
+
 def fetch_source_payload(force=False, use_cache=True):
     cache_ttl = max(int(getattr(settings, 'MERCHANT_NOTICE_CACHE_TTL_SECONDS', 30) or 30), 0)
     if use_cache and not force and _CURRENT_PAYLOAD_CACHE['payload'] and _CURRENT_PAYLOAD_CACHE['expires_at'] > time.monotonic():
         return copy.deepcopy(_CURRENT_PAYLOAD_CACHE['payload'])
 
-    try:
-        response = requests.get(
-            settings.MERCHANT_SOURCE_URL,
-            headers=build_source_headers(),
-            timeout=float(getattr(settings, 'MERCHANT_NOTIFY_FETCH_TIMEOUT_SECONDS', 8)),
-        )
-    except requests.RequestException as error:
-        raise MerchantNoticeSourceError(f'远行商人源站请求失败: {error}') from error
+    errors = []
+    for source_name in get_merchant_source_priority_list():
+        try:
+            normalized = fetch_source_payload_from_priority(source_name)
+            _CURRENT_PAYLOAD_CACHE['payload'] = copy.deepcopy(normalized)
+            _CURRENT_PAYLOAD_CACHE['expires_at'] = time.monotonic() + cache_ttl
+            return normalized
+        except MerchantNoticeSourceError as error:
+            errors.append(f'{source_name}: {error}')
 
-    if response.status_code < 200 or response.status_code >= 300:
-        raise MerchantNoticeSourceError(f'远行商人源站返回异常状态码: {response.status_code}')
-
-    try:
-        raw_payload = response.json()
-    except ValueError as error:
-        raise MerchantNoticeSourceError('远行商人源站返回了非 JSON 数据') from error
-
-    normalized = normalize_source_payload(raw_payload if isinstance(raw_payload, dict) else {})
-    _CURRENT_PAYLOAD_CACHE['payload'] = copy.deepcopy(normalized)
-    _CURRENT_PAYLOAD_CACHE['expires_at'] = time.monotonic() + cache_ttl
-    return normalized
+    raise MerchantNoticeSourceError('；'.join(errors) if errors else '远行商人数据源全部请求失败')
 
 
 def load_items_json(value):
@@ -412,40 +707,6 @@ def get_current_payload_for_display():
         raise
 
 
-def build_subscription_state(record):
-    if not record:
-        return {
-            'status': MerchantNoticeSubscription.STATUS_IDLE,
-            'isActive': False,
-            'buttonText': '开启下一次提醒',
-            'helperText': '完成授权后，命中珍贵商品时会提醒您一次。',
-            'subscribedAt': '',
-            'consumedAt': '',
-        }
-
-    if record.status == MerchantNoticeSubscription.STATUS_ACTIVE:
-        button_text = '已开启下一次提醒'
-        helper_text = '已记录本次授权，命中珍贵商品时会提醒您一次。'
-    elif record.status == MerchantNoticeSubscription.STATUS_CONSUMED:
-        button_text = '重新开启下一次提醒'
-        helper_text = '上一次提醒已发送，回到蛋查查后可手动开启下一次提醒。'
-    elif record.status == MerchantNoticeSubscription.STATUS_INVALID:
-        button_text = '重新开启下一次提醒'
-        helper_text = '当前提醒已失效，请重新授权订阅消息。'
-    else:
-        button_text = '开启下一次提醒'
-        helper_text = '完成授权后，命中珍贵商品时会提醒您一次。'
-
-    return {
-        'status': record.status,
-        'isActive': record.status == MerchantNoticeSubscription.STATUS_ACTIVE,
-        'buttonText': button_text,
-        'helperText': helper_text,
-        'subscribedAt': format_iso_datetime(record.subscribed_at),
-        'consumedAt': format_iso_datetime(record.consumed_at),
-    }
-
-
 def get_notice_service_status():
     missing_config_keys = []
     missing_config_labels = []
@@ -471,6 +732,214 @@ def get_notice_service_status():
 
 def get_notice_service_ready():
     return get_notice_service_status()['ready']
+
+
+def get_subscription_pending_count(record):
+    if not record:
+        return 0
+    return max(parse_int(getattr(record, 'pending_count', 0), 0), 0)
+
+
+def get_subscription_notify_count(record):
+    if not record:
+        return 0
+    return max(parse_int(getattr(record, 'notify_count', 0), 0), 0)
+
+
+def get_subscription_daily_increment_date(record):
+    if not record:
+        return None
+    value = getattr(record, 'daily_increment_date', None)
+    return value if isinstance(value, date) else None
+
+
+def get_subscription_daily_increment_count(record, local_date=None):
+    if not record:
+        return 0
+    normalized_date = local_date or get_local_now().date()
+    if get_subscription_daily_increment_date(record) != normalized_date:
+        return 0
+    return max(parse_int(getattr(record, 'daily_increment_count', 0), 0), 0)
+
+
+def get_subscription_daily_reward_unlock_count(record, local_date=None):
+    if not record:
+        return 0
+    normalized_date = local_date or get_local_now().date()
+    if get_subscription_daily_increment_date(record) != normalized_date:
+        return 0
+    return max(parse_int(getattr(record, 'daily_reward_unlock_count', 0), 0), 0)
+
+
+def reset_subscription_daily_reward_gate(record, now=None):
+    if not record:
+        return []
+
+    normalized_now = now or make_naive_local(get_local_now())
+    local_date = normalized_now.date()
+    updated_fields = []
+
+    if get_subscription_daily_increment_date(record) != local_date:
+        record.daily_increment_date = local_date
+        record.daily_increment_count = 0
+        record.daily_reward_unlock_count = 0
+        updated_fields.extend([
+            'daily_increment_date',
+            'daily_increment_count',
+            'daily_reward_unlock_count',
+        ])
+
+    return updated_fields
+
+
+def build_reward_gate_state(record, local_date=None):
+    normalized_date = local_date or get_local_now().date()
+    reward_step = get_rewarded_increment_step()
+    daily_increment_count = get_subscription_daily_increment_count(record, normalized_date)
+    daily_reward_unlock_count = get_subscription_daily_reward_unlock_count(record, normalized_date)
+    required_reward_unlock_count = daily_increment_count // reward_step
+    requires_rewarded_ad = daily_reward_unlock_count < required_reward_unlock_count
+    next_reward_gate_count = ((daily_increment_count // reward_step) + 1) * reward_step
+    remaining_before_gate = 0 if requires_rewarded_ad else max(next_reward_gate_count - daily_increment_count, 0)
+
+    return {
+        'dailyIncrementDate': normalized_date.isoformat(),
+        'dailyIncrementCount': daily_increment_count,
+        'dailyRewardUnlockCount': daily_reward_unlock_count,
+        'rewardStep': reward_step,
+        'requiredRewardUnlockCount': required_reward_unlock_count,
+        'requiresRewardedAd': requires_rewarded_ad,
+        'nextRewardGateCount': next_reward_gate_count,
+        'remainingBeforeGate': remaining_before_gate,
+    }
+
+
+def build_reward_unlock_required_message(record, local_date=None):
+    reward_gate_state = build_reward_gate_state(record, local_date=local_date)
+    current_count = max(reward_gate_state['dailyIncrementCount'], reward_gate_state['rewardStep'])
+    return f'今日已累计增加 {current_count} 次提醒机会，请先完成一次激励视频后再继续累加。'
+
+
+def get_effective_selected_goods(record):
+    parsed = parse_selected_goods_value(getattr(record, 'selected_goods_json', '[]') if record else '[]')
+    return parsed or get_default_selected_goods()
+
+
+def build_subscription_preferences(record):
+    selected_goods = get_effective_selected_goods(record)
+    return {
+        'selectedGoods': selected_goods,
+        'selectedGoodsCount': len(selected_goods),
+        'defaultSelectedGoods': get_default_selected_goods(),
+    }
+
+
+def build_subscription_state(record):
+    pending_count = get_subscription_pending_count(record)
+    notify_count = get_subscription_notify_count(record)
+    preferences = build_subscription_preferences(record)
+    reward_gate_state = build_reward_gate_state(record)
+    if not record:
+        return {
+            'status': MerchantNoticeSubscription.STATUS_IDLE,
+            'isActive': False,
+            'buttonText': '订阅提醒(剩0次)',
+            'helperText': '每次完成授权都会累计 1 次提醒机会。',
+            'subscribedAt': '',
+            'consumedAt': '',
+            'pendingCount': 0,
+            'notifyCount': 0,
+            **reward_gate_state,
+            **preferences,
+        }
+
+    if pending_count > 0:
+        effective_status = MerchantNoticeSubscription.STATUS_ACTIVE
+        button_text = f'订阅提醒(剩{pending_count}次)'
+        helper_text = f'当前剩余 {pending_count} 次提醒机会，命中已选商品时会消耗 1 次。'
+    elif record.status == MerchantNoticeSubscription.STATUS_CONSUMED or notify_count > 0:
+        effective_status = MerchantNoticeSubscription.STATUS_CONSUMED
+        button_text = '订阅提醒(剩0次)'
+        helper_text = '上一次提醒已发送完毕，可继续追加新的提醒次数。'
+    elif record.status == MerchantNoticeSubscription.STATUS_INVALID:
+        effective_status = MerchantNoticeSubscription.STATUS_INVALID
+        button_text = '订阅提醒(剩0次)'
+        helper_text = '当前提醒已失效，请重新授权订阅消息。'
+    else:
+        effective_status = MerchantNoticeSubscription.STATUS_IDLE
+        button_text = '订阅提醒(剩0次)'
+        helper_text = '每次完成授权都会累计 1 次提醒机会。'
+
+    return {
+        'status': effective_status,
+        'isActive': pending_count > 0,
+        'buttonText': button_text,
+        'helperText': helper_text,
+        'subscribedAt': format_iso_datetime(record.subscribed_at),
+        'consumedAt': format_iso_datetime(record.consumed_at),
+        'pendingCount': pending_count,
+        'notifyCount': notify_count,
+        **reward_gate_state,
+        **preferences,
+    }
+
+
+def build_subscription_defaults(openid, appid, now):
+    return {
+        'openid_hash': hashlib.sha256(f'{settings.SECRET_KEY}:{openid}'.encode('utf-8')).hexdigest(),
+        'appid': normalize_text(appid, 64),
+        'template_id': normalize_text(getattr(settings, 'MERCHANT_NOTIFY_TEMPLATE_ID', ''), 128),
+        'status': MerchantNoticeSubscription.STATUS_IDLE,
+        'subscribed_at': now,
+        'consumed_at': None,
+        'pending_count': 0,
+        'daily_increment_date': now.date(),
+        'daily_increment_count': 0,
+        'daily_reward_unlock_count': 0,
+        'selected_goods_json': serialize_goods_names(get_default_selected_goods()),
+        'last_error_code': '',
+        'last_error_message': '',
+        'notify_count': 0,
+        'created_at': now,
+        'updated_at': now,
+    }
+
+
+def apply_subscription_identity(subscription, openid, appid=''):
+    updated_fields = []
+    normalized_appid = normalize_text(appid, 64)
+    expected_openid_hash = hashlib.sha256(f'{settings.SECRET_KEY}:{openid}'.encode('utf-8')).hexdigest()
+    expected_template_id = normalize_text(getattr(settings, 'MERCHANT_NOTIFY_TEMPLATE_ID', ''), 128)
+
+    if subscription.openid_hash != expected_openid_hash:
+        subscription.openid_hash = expected_openid_hash
+        updated_fields.append('openid_hash')
+    if normalized_appid and subscription.appid != normalized_appid:
+        subscription.appid = normalized_appid
+        updated_fields.append('appid')
+    if subscription.template_id != expected_template_id:
+        subscription.template_id = expected_template_id
+        updated_fields.append('template_id')
+
+    return updated_fields
+
+
+def ensure_subscription_profile(openid, appid=''):
+    now = make_naive_local(get_local_now())
+    defaults = build_subscription_defaults(openid, appid, now)
+    subscription, created = MerchantNoticeSubscription.objects.get_or_create(openid=openid, defaults=defaults)
+    if created:
+        return subscription, True
+
+    updated_fields = apply_subscription_identity(subscription, openid, appid)
+    if not parse_selected_goods_value(subscription.selected_goods_json):
+        subscription.selected_goods_json = defaults['selected_goods_json']
+        updated_fields.append('selected_goods_json')
+    if updated_fields:
+        subscription.updated_at = now
+        updated_fields.append('updated_at')
+        subscription.save(update_fields=updated_fields)
+    return subscription, False
 
 
 def sanitize_current_payload_for_client(payload):
@@ -506,6 +975,7 @@ def build_current_response(openid=''):
         ),
         'isFallbackData': bool(is_fallback_data),
         'specialKeywords': get_special_keywords(),
+        'defaultSelectedGoods': get_default_selected_goods(),
         'current': payload,
         'subscription': build_subscription_state(subscription),
     }
@@ -513,44 +983,107 @@ def build_current_response(openid=''):
 
 def get_or_create_subscription(openid, appid):
     now = make_naive_local(get_local_now())
-    defaults = {
-        'openid_hash': hashlib.sha256(f'{settings.SECRET_KEY}:{openid}'.encode('utf-8')).hexdigest(),
-        'appid': normalize_text(appid, 64),
-        'template_id': normalize_text(getattr(settings, 'MERCHANT_NOTIFY_TEMPLATE_ID', ''), 128),
-        'status': MerchantNoticeSubscription.STATUS_ACTIVE,
-        'subscribed_at': now,
-        'consumed_at': None,
-        'last_error_code': '',
-        'last_error_message': '',
-        'notify_count': 0,
-        'created_at': now,
-        'updated_at': now,
-    }
-    subscription, created = MerchantNoticeSubscription.objects.get_or_create(openid=openid, defaults=defaults)
-    if created:
-        return subscription, True
+    normalized_appid = normalize_text(appid, 64)
 
-    subscription.openid_hash = defaults['openid_hash']
-    subscription.appid = defaults['appid']
-    subscription.template_id = defaults['template_id']
-    subscription.status = MerchantNoticeSubscription.STATUS_ACTIVE
-    subscription.subscribed_at = now
-    subscription.consumed_at = None
-    subscription.last_error_code = ''
-    subscription.last_error_message = ''
-    subscription.updated_at = now
-    subscription.save(update_fields=[
-        'openid_hash',
-        'appid',
-        'template_id',
-        'status',
-        'subscribed_at',
-        'consumed_at',
-        'last_error_code',
-        'last_error_message',
-        'updated_at',
-    ])
-    return subscription, False
+    with transaction.atomic():
+        subscription, created = ensure_subscription_profile(openid, normalized_appid)
+        subscription = MerchantNoticeSubscription.objects.select_for_update().get(pk=subscription.pk)
+
+        updated_fields = apply_subscription_identity(subscription, openid, normalized_appid)
+        updated_fields.extend(reset_subscription_daily_reward_gate(subscription, now=now))
+        local_date = now.date()
+        reward_gate_state = build_reward_gate_state(subscription, local_date=local_date)
+        if reward_gate_state['requiresRewardedAd']:
+            if updated_fields:
+                subscription.updated_at = now
+                updated_fields.append('updated_at')
+                subscription.save(update_fields=list(dict.fromkeys(updated_fields)))
+            raise MerchantNoticeValidationError(build_reward_unlock_required_message(subscription, local_date=local_date))
+
+        subscription.status = MerchantNoticeSubscription.STATUS_ACTIVE
+        subscription.subscribed_at = now
+        subscription.consumed_at = None
+        subscription.pending_count = get_subscription_pending_count(subscription) + 1
+        subscription.daily_increment_date = local_date
+        subscription.daily_increment_count = get_subscription_daily_increment_count(subscription, local_date) + 1
+        subscription.last_error_code = ''
+        subscription.last_error_message = ''
+        subscription.updated_at = now
+        updated_fields.extend([
+            'status',
+            'subscribed_at',
+            'consumed_at',
+            'pending_count',
+            'daily_increment_date',
+            'daily_increment_count',
+            'last_error_code',
+            'last_error_message',
+            'updated_at',
+        ])
+        subscription.save(update_fields=list(dict.fromkeys(updated_fields)))
+
+    return subscription, created
+
+
+def prepare_subscription_next(openid, appid=''):
+    service_status = get_notice_service_status()
+    if not service_status['ready']:
+        raise MerchantNoticeConfigurationError(f'远行提醒未完成通知配置：{service_status["message"]}')
+
+    normalized_openid = normalize_text(openid, 128)
+    if not normalized_openid:
+        raise MerchantNoticePermissionError('未获取到当前用户身份，暂时无法开启提醒')
+
+    subscription, created = ensure_subscription_profile(normalized_openid, appid)
+    reward_gate_state = build_reward_gate_state(subscription)
+    return {
+        'created': created,
+        'allowed': not reward_gate_state['requiresRewardedAd'],
+        'requiresRewardedAd': reward_gate_state['requiresRewardedAd'],
+        'subscription': build_subscription_state(subscription),
+    }
+
+
+def unlock_subscription_rewarded_gate(openid, appid=''):
+    service_status = get_notice_service_status()
+    if not service_status['ready']:
+        raise MerchantNoticeConfigurationError(f'远行提醒未完成通知配置：{service_status["message"]}')
+
+    normalized_openid = normalize_text(openid, 128)
+    if not normalized_openid:
+        raise MerchantNoticePermissionError('未获取到当前用户身份，暂时无法完成激励校验')
+
+    now = make_naive_local(get_local_now())
+    normalized_appid = normalize_text(appid, 64)
+
+    with transaction.atomic():
+        subscription, created = ensure_subscription_profile(normalized_openid, normalized_appid)
+        subscription = MerchantNoticeSubscription.objects.select_for_update().get(pk=subscription.pk)
+
+        updated_fields = apply_subscription_identity(subscription, normalized_openid, normalized_appid)
+        updated_fields.extend(reset_subscription_daily_reward_gate(subscription, now=now))
+        local_date = now.date()
+        reward_gate_state = build_reward_gate_state(subscription, local_date=local_date)
+        current_unlock_count = get_subscription_daily_reward_unlock_count(subscription, local_date)
+        granted_unlock_count = max(reward_gate_state['requiredRewardUnlockCount'] - current_unlock_count, 0)
+
+        if granted_unlock_count > 0:
+            subscription.daily_reward_unlock_count = current_unlock_count + granted_unlock_count
+            updated_fields.append('daily_reward_unlock_count')
+
+        if updated_fields:
+            subscription.updated_at = now
+            updated_fields.append('updated_at')
+            subscription.save(update_fields=list(dict.fromkeys(updated_fields)))
+
+    updated_reward_gate_state = build_reward_gate_state(subscription)
+    return {
+        'created': created,
+        'grantedUnlockCount': granted_unlock_count,
+        'allowed': not updated_reward_gate_state['requiresRewardedAd'],
+        'requiresRewardedAd': updated_reward_gate_state['requiresRewardedAd'],
+        'subscription': build_subscription_state(subscription),
+    }
 
 
 def subscribe_next(openid, appid=''):
@@ -564,7 +1097,112 @@ def subscribe_next(openid, appid=''):
     subscription, created = get_or_create_subscription(normalized_openid, appid)
     return {
         'created': created,
+        'grantedCount': 1,
         'subscription': build_subscription_state(subscription),
+    }
+
+
+def build_dev_self_test_payload():
+    now = get_local_now()
+    return {
+        'date2': now.strftime('%m-%d %H:%M'),
+        'thing7': build_special_item_summary(DEV_SELF_TEST_ITEM_NAMES),
+        'thing10': truncate_text(DEV_SELF_TEST_ADVICE, 20),
+        'page': normalize_text(
+            getattr(settings, 'MERCHANT_NOTIFY_PAGE', 'pages/merchant-notice/index'),
+            255,
+        ),
+        'miniprogramState': 'developer',
+        'campaignKey': f'dev-self-test-{format_iso_datetime(now)}-{time.time_ns()}',
+    }
+
+
+def send_dev_self_test_message(openid, appid=''):
+    service_status = get_notice_service_status()
+    if not service_status['ready']:
+        raise MerchantNoticeConfigurationError(f'远行提醒未完成通知配置：{service_status["message"]}')
+
+    normalized_openid = normalize_text(openid, 128)
+    if not normalized_openid:
+        raise MerchantNoticePermissionError('未获取到当前用户身份，暂时无法发送测试通知')
+
+    now = make_naive_local(get_local_now())
+    subscription, _created = ensure_subscription_profile(normalized_openid, appid)
+    subscription = MerchantNoticeSubscription.objects.filter(pk=subscription.pk).first()
+
+    updated_fields = apply_subscription_identity(subscription, normalized_openid, appid)
+    updated_fields.extend(reset_subscription_daily_reward_gate(subscription, now=now))
+    if updated_fields:
+        subscription.updated_at = now
+        updated_fields.append('updated_at')
+        subscription.save(update_fields=list(dict.fromkeys(updated_fields)))
+
+    if get_subscription_pending_count(subscription) <= 0:
+        raise MerchantNoticeValidationError('请先订阅至少 1 次提醒后，再发送开发模式测试通知')
+    if subscription.status == MerchantNoticeSubscription.STATUS_INVALID:
+        raise MerchantNoticeValidationError('当前提醒已失效，请重新授权订阅消息后再测试')
+
+    payload = build_dev_self_test_payload()
+    snapshot, _snapshot_created = get_or_create_manual_snapshot(
+        payload,
+        campaign_key=payload['campaignKey'],
+    )
+    result = send_subscribe_message(
+        subscription,
+        snapshot,
+        message_body=build_manual_subscribe_message_body(subscription, payload),
+        special_item_names=payload.get('thing7'),
+    )
+    refreshed_subscription = MerchantNoticeSubscription.objects.filter(pk=subscription.pk).first()
+    return {
+        'status': result.get('status', ''),
+        'messagePayload': {
+            'date2': payload['date2'],
+            'thing7': payload['thing7'],
+            'thing10': payload['thing10'],
+        },
+        'snapshotFingerprint': snapshot.fingerprint,
+        'subscription': build_subscription_state(refreshed_subscription),
+        'result': result,
+    }
+
+
+def get_subscription_preferences(openid=''):
+    normalized_openid = normalize_text(openid, 128)
+    if not normalized_openid:
+        raise MerchantNoticePermissionError('未获取到当前用户身份，暂时无法读取通知商品配置')
+
+    subscription = MerchantNoticeSubscription.objects.filter(openid=normalized_openid).first()
+    return {
+        'subscription': build_subscription_state(subscription),
+        'preferences': build_subscription_preferences(subscription),
+    }
+
+
+def update_subscription_preferences(openid, selected_goods, appid=''):
+    normalized_openid = normalize_text(openid, 128)
+    if not normalized_openid:
+        raise MerchantNoticePermissionError('未获取到当前用户身份，暂时无法保存通知商品配置')
+
+    normalized_goods = parse_selected_goods_value(selected_goods)
+    if not normalized_goods:
+        raise MerchantNoticeValidationError('请至少选择 1 个通知商品')
+
+    subscription, created = ensure_subscription_profile(normalized_openid, appid)
+    now = make_naive_local(get_local_now())
+    subscription.selected_goods_json = serialize_goods_names(normalized_goods)
+    if appid:
+        subscription.appid = normalize_text(appid, 64)
+    subscription.updated_at = now
+    subscription.save(update_fields=[
+        'selected_goods_json',
+        'appid',
+        'updated_at',
+    ])
+    return {
+        'created': created,
+        'subscription': build_subscription_state(subscription),
+        'preferences': build_subscription_preferences(subscription),
     }
 
 
@@ -626,11 +1264,64 @@ def build_special_item_summary(names):
     return truncate_text(f'{first_name}等{len(normalized_names)}件', 20)
 
 
-def build_subscribe_message_body(subscription, snapshot):
-    special_names = [
-        name for name in str(snapshot.special_item_names or '').split('、')
-        if name
+def normalize_message_item_names(snapshot, item_names=None):
+    if item_names:
+        if isinstance(item_names, str):
+            normalized = dedupe_goods_names(str(item_names).split('、'))
+        else:
+            normalized = dedupe_goods_names(item_names)
+        if normalized:
+            return normalized
+
+    return dedupe_goods_names(str(snapshot.special_item_names or '').split('、'))
+
+
+def get_snapshot_item_names(snapshot):
+    return dedupe_goods_names([
+        item.get('name')
+        for item in load_items_json(snapshot.items_json)
+        if isinstance(item, dict)
+    ])
+
+
+def get_matching_selected_goods(subscription, snapshot):
+    selected_goods = set(get_effective_selected_goods(subscription))
+    if not selected_goods:
+        return []
+    return [
+        item_name
+        for item_name in get_snapshot_item_names(snapshot)
+        if item_name in selected_goods
     ]
+
+
+def get_dispatchable_subscription_queryset():
+    return MerchantNoticeSubscription.objects.filter(
+        status=MerchantNoticeSubscription.STATUS_ACTIVE,
+        pending_count__gt=0,
+    ).order_by('id')
+
+
+def get_dispatchable_subscriptions():
+    return list(get_dispatchable_subscription_queryset())
+
+
+def iter_snapshot_dispatch_targets(snapshot):
+    for subscription in get_dispatchable_subscription_queryset().iterator(chunk_size=100):
+        matched_names = get_matching_selected_goods(subscription, snapshot)
+        if matched_names:
+            yield subscription, matched_names
+
+
+def count_snapshot_dispatch_targets(snapshot):
+    target_count = 0
+    for _subscription, _matched_names in iter_snapshot_dispatch_targets(snapshot):
+        target_count += 1
+    return target_count
+
+
+def build_subscribe_message_body(subscription, snapshot, matched_item_names=None):
+    special_names = normalize_message_item_names(snapshot, matched_item_names)
     body = {
         'touser': subscription.openid,
         'template_id': str(getattr(settings, 'MERCHANT_NOTIFY_TEMPLATE_ID', '') or '').strip(),
@@ -703,7 +1394,11 @@ def send_subscribe_message(subscription, snapshot, message_body=None, special_it
             'reason': 'already_sent',
         }
 
-    request_payload = message_body or build_subscribe_message_body(subscription, snapshot)
+    request_payload = message_body or build_subscribe_message_body(
+        subscription,
+        snapshot,
+        matched_item_names=special_item_names,
+    )
     access_token = build_wechat_access_token()
     try:
         response = requests.post(
@@ -724,7 +1419,7 @@ def send_subscribe_message(subscription, snapshot, message_body=None, special_it
     errcode = str(data.get('errcode', ''))
     errmsg = normalize_text(data.get('errmsg'), 255)
     msg_id = normalize_text(data.get('msgid') or data.get('msg_id'), 64)
-    special_item_names = normalize_text(special_item_names or snapshot.special_item_names, 255)
+    special_item_names = normalize_text('、'.join(normalize_message_item_names(snapshot, special_item_names)), 255)
     template_id = normalize_text(
         request_payload.get('template_id') or getattr(settings, 'MERCHANT_NOTIFY_TEMPLATE_ID', ''),
         128,
@@ -750,7 +1445,13 @@ def send_subscribe_message(subscription, snapshot, message_body=None, special_it
         existing_log.status = MerchantNoticeSendLog.STATUS_SUCCESS
         existing_log.save()
 
-        subscription.status = MerchantNoticeSubscription.STATUS_CONSUMED
+        next_pending_count = max(get_subscription_pending_count(subscription) - 1, 0)
+        subscription.pending_count = next_pending_count
+        subscription.status = (
+            MerchantNoticeSubscription.STATUS_ACTIVE
+            if next_pending_count > 0
+            else MerchantNoticeSubscription.STATUS_CONSUMED
+        )
         subscription.consumed_at = now
         subscription.last_notified_snapshot = snapshot
         subscription.notify_count = max(parse_int(subscription.notify_count, 0), 0) + 1
@@ -760,6 +1461,7 @@ def send_subscribe_message(subscription, snapshot, message_body=None, special_it
         subscription.save(update_fields=[
             'status',
             'consumed_at',
+            'pending_count',
             'last_notified_snapshot',
             'notify_count',
             'last_error_code',
@@ -776,6 +1478,7 @@ def send_subscribe_message(subscription, snapshot, message_body=None, special_it
 
     if errcode in get_invalid_subscription_error_codes():
         subscription.status = MerchantNoticeSubscription.STATUS_INVALID
+        subscription.pending_count = 0
         subscription.consumed_at = now
     subscription.last_error_code = errcode
     subscription.last_error_message = errmsg
@@ -783,6 +1486,7 @@ def send_subscribe_message(subscription, snapshot, message_body=None, special_it
     subscription.save(update_fields=[
         'status',
         'consumed_at',
+        'pending_count',
         'last_error_code',
         'last_error_message',
         'updated_at',
@@ -865,22 +1569,249 @@ def get_or_create_manual_snapshot(payload, campaign_key=''):
     return snapshot, created
 
 
+def serialize_dispatch_job(job):
+    if not job:
+        return {}
+    return {
+        'jobKey': job.job_key,
+        'jobType': job.job_type,
+        'status': job.status,
+        'targetCount': job.target_count,
+        'successCount': job.success_count,
+        'failedCount': job.failed_count,
+        'skippedCount': job.skipped_count,
+        'lastError': job.last_error,
+        'startedAt': format_iso_datetime(job.started_at),
+        'finishedAt': format_iso_datetime(job.finished_at),
+        'createdAt': format_iso_datetime(job.created_at),
+    }
+
+
+def parse_dispatch_job_payload(value):
+    try:
+        parsed = json.loads(value or '{}')
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def build_snapshot_dispatch_job_key(snapshot):
+    return f'{SNAPSHOT_DISPATCH_JOB_PREFIX}{snapshot.fingerprint}'
+
+
+def build_manual_dispatch_job_key(campaign_key):
+    return f'{MANUAL_DISPATCH_JOB_PREFIX}{resolve_manual_campaign_key(campaign_key)}'
+
+
+def get_dispatch_worker_idle_seconds():
+    return max(float(getattr(settings, 'MERCHANT_NOTICE_DISPATCH_WORKER_IDLE_SECONDS', 2) or 2), 0.5)
+
+
+def get_dispatch_worker_stale_seconds():
+    return max(parse_int(getattr(settings, 'MERCHANT_NOTICE_DISPATCH_WORKER_STALE_SECONDS', 600), 600), 60)
+
+
+def enqueue_dispatch_job(job_key, job_type, snapshot=None, payload=None, target_count=0):
+    now = make_naive_local(get_local_now())
+    payload_json = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True)
+    defaults = {
+        'job_type': job_type,
+        'snapshot': snapshot,
+        'status': MerchantNoticeDispatchJob.STATUS_PENDING,
+        'payload_json': payload_json,
+        'target_count': max(parse_int(target_count, 0), 0),
+        'success_count': 0,
+        'failed_count': 0,
+        'skipped_count': 0,
+        'last_error': '',
+        'started_at': None,
+        'finished_at': None,
+        'created_at': now,
+    }
+    job, created = MerchantNoticeDispatchJob.objects.get_or_create(job_key=job_key, defaults=defaults)
+    if created:
+        return job, True
+
+    updated_fields = []
+    if snapshot and job.snapshot_id != snapshot.id:
+        job.snapshot = snapshot
+        updated_fields.append('snapshot')
+    if job.payload_json != payload_json:
+        job.payload_json = payload_json
+        updated_fields.append('payload_json')
+    if max(parse_int(target_count, 0), 0) > max(parse_int(job.target_count, 0), 0):
+        job.target_count = max(parse_int(target_count, 0), 0)
+        updated_fields.append('target_count')
+    if updated_fields:
+        job.updated_at = now
+        updated_fields.append('updated_at')
+        job.save(update_fields=updated_fields)
+    return job, False
+
+
+def finalize_dispatch_job(job, status, target_count, success_count, failed_count, skipped_count, last_error=''):
+    now = make_naive_local(get_local_now())
+    job.status = status
+    job.target_count = max(parse_int(target_count, 0), 0)
+    job.success_count = max(parse_int(success_count, 0), 0)
+    job.failed_count = max(parse_int(failed_count, 0), 0)
+    job.skipped_count = max(parse_int(skipped_count, 0), 0)
+    job.last_error = normalize_text(last_error, 255)
+    job.finished_at = now
+    job.updated_at = now
+    job.save(update_fields=[
+        'status',
+        'target_count',
+        'success_count',
+        'failed_count',
+        'skipped_count',
+        'last_error',
+        'finished_at',
+        'updated_at',
+    ])
+
+    if job.snapshot_id:
+        job.snapshot.notification_target_count = job.target_count
+        job.snapshot.notification_success_count = job.success_count
+        if failed_count == 0:
+            job.snapshot.notification_dispatched_at = now
+        job.snapshot.save(update_fields=[
+            'notification_target_count',
+            'notification_success_count',
+            'notification_dispatched_at',
+        ])
+
+    return serialize_dispatch_job(job)
+
+
+def process_dispatch_job(job):
+    if not job:
+        return {'status': 'idle'}
+
+    payload = parse_dispatch_job_payload(job.payload_json)
+    success_count = 0
+    failed_count = 0
+    skipped_count = 0
+    last_error = ''
+    target_count = 0
+
+    try:
+        if job.job_type == MerchantNoticeDispatchJob.JOB_TYPE_MANUAL:
+            message_payload = payload.get('message') if isinstance(payload.get('message'), dict) else {}
+            target_count = get_dispatchable_subscription_queryset().count()
+            for subscription in get_dispatchable_subscription_queryset().iterator(chunk_size=100):
+                message_body = build_manual_subscribe_message_body(subscription, message_payload)
+                result = send_subscribe_message(
+                    subscription,
+                    job.snapshot,
+                    message_body=message_body,
+                    special_item_names=message_payload.get('thing7'),
+                )
+                if result['status'] == 'success':
+                    success_count += 1
+                elif result['status'] == 'skipped':
+                    skipped_count += 1
+                else:
+                    failed_count += 1
+                    last_error = result.get('errorMessage') or result.get('errorCode') or last_error
+        else:
+            target_count = 0
+            for subscription, matched_names in iter_snapshot_dispatch_targets(job.snapshot):
+                target_count += 1
+                result = send_subscribe_message(
+                    subscription,
+                    job.snapshot,
+                    special_item_names=matched_names,
+                )
+                if result['status'] == 'success':
+                    success_count += 1
+                elif result['status'] == 'skipped':
+                    skipped_count += 1
+                else:
+                    failed_count += 1
+                    last_error = result.get('errorMessage') or result.get('errorCode') or last_error
+    except Exception as error:
+        last_error = str(error)
+        return finalize_dispatch_job(
+            job,
+            MerchantNoticeDispatchJob.STATUS_FAILED,
+            target_count,
+            success_count,
+            failed_count + 1,
+            skipped_count,
+            last_error=last_error,
+        )
+
+    final_status = MerchantNoticeDispatchJob.STATUS_COMPLETED
+    if failed_count > 0:
+        final_status = MerchantNoticeDispatchJob.STATUS_PARTIAL_FAILED
+    return finalize_dispatch_job(
+        job,
+        final_status,
+        target_count,
+        success_count,
+        failed_count,
+        skipped_count,
+        last_error=last_error,
+    )
+
+
+def claim_next_dispatch_job():
+    now = make_naive_local(get_local_now())
+    stale_before = now - timedelta(seconds=get_dispatch_worker_stale_seconds())
+    with transaction.atomic():
+        MerchantNoticeDispatchJob.objects.filter(
+            status=MerchantNoticeDispatchJob.STATUS_RUNNING,
+            started_at__lt=stale_before,
+        ).update(
+            status=MerchantNoticeDispatchJob.STATUS_PENDING,
+            started_at=None,
+            updated_at=now,
+            last_error='worker_stale_reset',
+        )
+
+        job = MerchantNoticeDispatchJob.objects.select_for_update().filter(
+            status=MerchantNoticeDispatchJob.STATUS_PENDING,
+        ).order_by('id').first()
+        if not job:
+            return None
+
+        job.status = MerchantNoticeDispatchJob.STATUS_RUNNING
+        job.started_at = now
+        job.finished_at = None
+        job.last_error = ''
+        job.updated_at = now
+        job.save(update_fields=[
+            'status',
+            'started_at',
+            'finished_at',
+            'last_error',
+            'updated_at',
+        ])
+        return job.id
+
+
+def run_dispatch_worker_once():
+    job_id = claim_next_dispatch_job()
+    if not job_id:
+        return {'status': 'idle'}
+
+    job = MerchantNoticeDispatchJob.objects.select_related('snapshot').filter(id=job_id).first()
+    if not job:
+        return {'status': 'missing_job'}
+    return process_dispatch_job(job)
+
+
 def broadcast_manual_message(payload):
     service_status = get_notice_service_status()
     if not service_status['ready']:
         raise MerchantNoticeConfigurationError(f'远行提醒未完成通知配置：{service_status["message"]}')
 
-    active_subscriptions = list(
-        MerchantNoticeSubscription.objects.filter(
-            status=MerchantNoticeSubscription.STATUS_ACTIVE,
-        ).order_by('id')
-    )
-
     preview = build_manual_subscribe_message_body(type('PreviewSubscription', (), {'openid': 'preview'})(), payload)
     preview.pop('touser', None)
     campaign_key = resolve_manual_campaign_key(payload.get('campaignKey'))
     snapshot_fingerprint = build_manual_snapshot_fingerprint(campaign_key)
-    target_count = len(active_subscriptions)
+    target_count = get_dispatchable_subscription_queryset().count()
 
     if payload.get('dryRun'):
         return {
@@ -895,110 +1826,67 @@ def broadcast_manual_message(payload):
         return {
             'dryRun': False,
             'created': False,
+            'queued': False,
             'campaignKey': campaign_key,
             'snapshotFingerprint': snapshot_fingerprint,
             'targetCount': 0,
-            'successCount': 0,
-            'failedCount': 0,
-            'skippedCount': 0,
-            'lastError': '',
             'messagePreview': preview,
         }
 
-    snapshot, created = get_or_create_manual_snapshot(payload, campaign_key=campaign_key)
-    success_count = 0
-    failed_count = 0
-    skipped_count = 0
-    last_error = ''
-
-    for subscription in active_subscriptions:
-        message_body = build_manual_subscribe_message_body(subscription, payload)
-        result = send_subscribe_message(
-            subscription,
-            snapshot,
-            message_body=message_body,
-            special_item_names=payload.get('thing7'),
-        )
-        if result['status'] == 'success':
-            success_count += 1
-        elif result['status'] == 'skipped':
-            skipped_count += 1
-        else:
-            failed_count += 1
-            last_error = result.get('errorMessage') or result.get('errorCode') or last_error
-
-    snapshot.notification_target_count = len(active_subscriptions)
-    snapshot.notification_success_count = success_count
-    if failed_count == 0:
-        snapshot.notification_dispatched_at = make_naive_local(get_local_now())
-    snapshot.save(update_fields=[
-        'notification_target_count',
-        'notification_success_count',
-        'notification_dispatched_at',
-    ])
-
+    snapshot, _created_snapshot = get_or_create_manual_snapshot(payload, campaign_key=campaign_key)
+    job, created = enqueue_dispatch_job(
+        build_manual_dispatch_job_key(campaign_key),
+        MerchantNoticeDispatchJob.JOB_TYPE_MANUAL,
+        snapshot=snapshot,
+        payload={'message': payload},
+        target_count=target_count,
+    )
     return {
         'dryRun': False,
         'created': created,
+        'queued': job.status == MerchantNoticeDispatchJob.STATUS_PENDING,
         'campaignKey': campaign_key,
         'snapshotFingerprint': snapshot.fingerprint,
         'targetCount': target_count,
-        'successCount': success_count,
-        'failedCount': failed_count,
-        'skippedCount': skipped_count,
-        'lastError': last_error,
         'messagePreview': preview,
+        'job': serialize_dispatch_job(job),
     }
 
 
 def dispatch_snapshot_notifications(snapshot):
-    if not snapshot.has_special_hit:
-        return {
-            'status': 'no_special_hit',
-            'targetCount': 0,
-            'successCount': 0,
-        }
     service_status = get_notice_service_status()
     if not service_status['ready']:
         raise MerchantNoticeConfigurationError(f'远行提醒未完成通知配置：{service_status["message"]}')
 
-    active_subscriptions = list(
-        MerchantNoticeSubscription.objects.filter(
-            status=MerchantNoticeSubscription.STATUS_ACTIVE,
-        ).order_by('id')
+    target_count = count_snapshot_dispatch_targets(snapshot)
+    if target_count <= 0:
+        snapshot.notification_target_count = 0
+        snapshot.notification_success_count = 0
+        snapshot.save(update_fields=[
+            'notification_target_count',
+            'notification_success_count',
+        ])
+        return {
+            'status': 'no_matching_subscriptions',
+            'targetCount': 0,
+            'successCount': 0,
+        }
+
+    job, created = enqueue_dispatch_job(
+        build_snapshot_dispatch_job_key(snapshot),
+        MerchantNoticeDispatchJob.JOB_TYPE_SNAPSHOT,
+        snapshot=snapshot,
+        payload={'source': 'watch_current_merchant'},
+        target_count=target_count,
     )
-
-    success_count = 0
-    failed_count = 0
-    skipped_count = 0
-    last_error = ''
-    for subscription in active_subscriptions:
-        result = send_subscribe_message(subscription, snapshot)
-        if result['status'] == 'success':
-            success_count += 1
-        elif result['status'] == 'skipped':
-            skipped_count += 1
-        else:
-            failed_count += 1
-            last_error = result.get('errorMessage') or result.get('errorCode') or last_error
-
-    snapshot.notification_target_count = len(active_subscriptions)
-    snapshot.notification_success_count = success_count
-    if failed_count == 0:
-        snapshot.notification_dispatched_at = make_naive_local(get_local_now())
-    snapshot.save(update_fields=[
-        'notification_target_count',
-        'notification_success_count',
-        'notification_dispatched_at',
-    ])
-
     return {
-        'status': 'sent' if failed_count == 0 else 'partial_failed',
-        'targetCount': len(active_subscriptions),
-        'successCount': success_count,
-        'failedCount': failed_count,
-        'skippedCount': skipped_count,
-        'lastError': last_error,
+        'status': 'queued',
+        'created': created,
+        'targetCount': target_count,
+        'successCount': job.success_count,
+        'failedCount': job.failed_count,
+        'skippedCount': job.skipped_count,
+        'job': serialize_dispatch_job(job),
     }
 
 

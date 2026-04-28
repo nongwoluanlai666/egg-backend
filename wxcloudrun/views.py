@@ -15,10 +15,16 @@ from wxcloudrun.merchant_notice import (
     MerchantNoticeConfigurationError,
     MerchantNoticePermissionError,
     MerchantNoticeSourceError,
+    MerchantNoticeValidationError,
     broadcast_manual_message as broadcast_manual_merchant_notice,
     build_current_response as build_merchant_notice_current_response,
+    get_subscription_preferences as get_merchant_notice_preferences,
+    prepare_subscription_next as prepare_next_merchant_notice_subscription,
     run_guarded_watch_current_merchant,
+    send_dev_self_test_message as send_dev_self_test_merchant_notice,
     subscribe_next as subscribe_next_merchant_notice,
+    unlock_subscription_rewarded_gate as unlock_merchant_notice_rewarded_gate,
+    update_subscription_preferences as update_merchant_notice_preferences,
     verify_job_request,
 )
 from wxcloudrun.local_model_predict import (
@@ -462,6 +468,8 @@ def merchant_notice_subscribe_next(request, _):
         rsp = json_response(0, '', subscribe_next_merchant_notice(openid=openid, appid=appid))
     except ValidationError as error:
         rsp = json_response(40001, str(error), status=400)
+    except MerchantNoticeValidationError as error:
+        rsp = json_response(40011, str(error), status=400)
     except MerchantNoticePermissionError as error:
         rsp = json_response(40111, str(error), status=401)
     except MerchantNoticeConfigurationError as error:
@@ -469,6 +477,134 @@ def merchant_notice_subscribe_next(request, _):
     except Exception:
         logger.exception('merchant notice subscribe unexpected error')
         rsp = json_response(50012, '开启远行提醒失败，请稍后再试', status=500)
+
+    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    return rsp
+
+
+def merchant_notice_subscribe_status(request, _):
+    if request.method != 'GET':
+        rsp = json_response(-1, '请求方式错误', status=405)
+        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        return rsp
+
+    try:
+        openid = get_header(request, 'X-WX-OPENID')
+        appid = get_header(request, 'X-WX-APPID')
+        rsp = json_response(
+            0,
+            '',
+            prepare_next_merchant_notice_subscription(openid=openid, appid=appid),
+        )
+    except MerchantNoticePermissionError as error:
+        rsp = json_response(40111, str(error), status=401)
+    except MerchantNoticeConfigurationError as error:
+        rsp = json_response(50311, str(error), status=503)
+    except Exception:
+        logger.exception('merchant notice subscribe status unexpected error')
+        rsp = json_response(50016, '远行提醒状态检查失败，请稍后再试', status=500)
+
+    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    return rsp
+
+
+def merchant_notice_reward_unlock(request, _):
+    if request.method != 'POST':
+        rsp = json_response(-1, '请求方式错误', status=405)
+        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        return rsp
+
+    try:
+        parse_json_body(request)
+        openid = get_header(request, 'X-WX-OPENID')
+        appid = get_header(request, 'X-WX-APPID')
+        rsp = json_response(
+            0,
+            '',
+            unlock_merchant_notice_rewarded_gate(openid=openid, appid=appid),
+        )
+    except ValidationError as error:
+        rsp = json_response(40001, str(error), status=400)
+    except MerchantNoticeValidationError as error:
+        rsp = json_response(40011, str(error), status=400)
+    except MerchantNoticePermissionError as error:
+        rsp = json_response(40111, str(error), status=401)
+    except MerchantNoticeConfigurationError as error:
+        rsp = json_response(50311, str(error), status=503)
+    except Exception:
+        logger.exception('merchant notice reward unlock unexpected error')
+        rsp = json_response(50017, '激励校验失败，请稍后再试', status=500)
+
+    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    return rsp
+
+
+def merchant_notice_dev_self_test(request, _):
+    if request.method != 'POST':
+        rsp = json_response(-1, '请求方式错误', status=405)
+        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        return rsp
+
+    try:
+        parse_json_body(request)
+        openid = get_header(request, 'X-WX-OPENID')
+        appid = get_header(request, 'X-WX-APPID')
+        rsp = json_response(
+            0,
+            '',
+            send_dev_self_test_merchant_notice(openid=openid, appid=appid),
+        )
+    except ValidationError as error:
+        rsp = json_response(40001, str(error), status=400)
+    except MerchantNoticeValidationError as error:
+        rsp = json_response(40011, str(error), status=400)
+    except MerchantNoticePermissionError as error:
+        rsp = json_response(40111, str(error), status=401)
+    except MerchantNoticeConfigurationError as error:
+        rsp = json_response(50311, str(error), status=503)
+    except MerchantNoticeSourceError as error:
+        rsp = json_response(50211, str(error), status=502)
+    except Exception:
+        logger.exception('merchant notice dev self test unexpected error')
+        rsp = json_response(50018, '开发模式测试通知发送失败，请稍后再试', status=500)
+
+    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    return rsp
+
+
+def merchant_notice_preferences(request, _):
+    if request.method not in {'GET', 'POST'}:
+        rsp = json_response(-1, '请求方式错误', status=405)
+        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        return rsp
+
+    try:
+        openid = get_header(request, 'X-WX-OPENID')
+        appid = get_header(request, 'X-WX-APPID')
+        if request.method == 'GET':
+            rsp = json_response(0, '', get_merchant_notice_preferences(openid=openid))
+        else:
+            body = parse_json_body(request)
+            rsp = json_response(
+                0,
+                '',
+                update_merchant_notice_preferences(
+                    openid=openid,
+                    appid=appid,
+                    selected_goods=body.get('selectedGoods') if isinstance(body, dict) else None,
+                ),
+            )
+    except ValidationError as error:
+        rsp = json_response(40001, str(error), status=400)
+    except MerchantNoticeValidationError as error:
+        rsp = json_response(40011, str(error), status=400)
+    except MerchantNoticePermissionError as error:
+        rsp = json_response(40111, str(error), status=401)
+    except MerchantNoticeConfigurationError as error:
+        rsp = json_response(50311, str(error), status=503)
+    except Exception:
+        logger.exception('merchant notice preferences unexpected error')
+        rsp = json_response(50015, '通知商品配置保存失败，请稍后再试', status=500)
 
     logger.info('response result: %s', rsp.content.decode('utf-8'))
     return rsp
