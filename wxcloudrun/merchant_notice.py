@@ -617,6 +617,30 @@ def serialize_snapshot(snapshot):
     }
 
 
+def summarize_payload(payload):
+    items = payload.get('items') or []
+    item_names = [
+        normalize_text(item.get('name'), 64)
+        for item in items
+        if isinstance(item, dict) and normalize_text(item.get('name'), 64)
+    ]
+    return {
+        'slotDate': normalize_text(payload.get('slotDate'), 16),
+        'round': max(parse_int(payload.get('round'), 0), 0),
+        'totalRounds': max(parse_int(payload.get('totalRounds'), 0), 0),
+        'itemCount': len(item_names),
+        'itemNames': item_names[:5],
+        'hasSpecialHit': bool(payload.get('hasSpecialHit')),
+        'specialItemNames': dedupe_goods_names(payload.get('specialItemNames') or []),
+        'sourceUpdatedAt': normalize_text(payload.get('sourceUpdatedAt'), 32),
+        'fingerprint': normalize_text(payload.get('fingerprint'), 64),
+    }
+
+
+def is_ready_snapshot_payload(payload):
+    return len(payload.get('items') or []) > 0
+
+
 def get_latest_snapshot(include_manual=False):
     queryset = MerchantSnapshot.objects.order_by('-slot_date', '-round', '-id')
     if not include_manual:
@@ -1489,6 +1513,13 @@ def send_subscribe_message(subscription, snapshot, message_body=None, special_it
             'last_error_message',
             'updated_at',
         ])
+        logger.info(
+            'merchant notice sent subscription_id=%s snapshot_id=%s pending_count=%s msg_id=%s',
+            subscription.id,
+            snapshot.id,
+            next_pending_count,
+            msg_id,
+        )
         return {
             'status': 'success',
             'msgId': msg_id,
@@ -1512,6 +1543,13 @@ def send_subscribe_message(subscription, snapshot, message_body=None, special_it
         'last_error_message',
         'updated_at',
     ])
+    logger.warning(
+        'merchant notice send failed subscription_id=%s snapshot_id=%s errcode=%s errmsg=%s',
+        subscription.id,
+        snapshot.id,
+        errcode,
+        errmsg,
+    )
     return {
         'status': 'failed',
         'errorCode': errcode,
@@ -1887,6 +1925,14 @@ def dispatch_snapshot_notifications(snapshot):
             'notification_target_count',
             'notification_success_count',
         ])
+        logger.info(
+            'merchant snapshot no matching subscriptions snapshot_id=%s slot_date=%s round=%s items=%s special_items=%s',
+            snapshot.id,
+            snapshot.slot_date.isoformat(),
+            snapshot.round,
+            len(load_items_json(snapshot.items_json)),
+            snapshot.special_item_names,
+        )
         return {
             'status': 'no_matching_subscriptions',
             'targetCount': 0,
@@ -1899,6 +1945,14 @@ def dispatch_snapshot_notifications(snapshot):
         snapshot=snapshot,
         payload={'source': 'watch_current_merchant'},
         target_count=target_count,
+    )
+    logger.info(
+        'merchant snapshot queued snapshot_id=%s job_key=%s created=%s target_count=%s special_items=%s',
+        snapshot.id,
+        job.job_key,
+        created,
+        target_count,
+        snapshot.special_item_names,
     )
     return {
         'status': 'queued',
@@ -1917,22 +1971,74 @@ def watch_current_merchant(timeout_seconds=None, poll_interval_seconds=None):
     started_at = time.monotonic()
     attempt_count = 0
     latest_snapshot = get_latest_snapshot()
+    last_observed_payload = {}
+
+    logger.info(
+        'merchant watch begin latest_snapshot_id=%s latest_fingerprint=%s timeout_seconds=%s poll_interval_seconds=%s',
+        latest_snapshot.id if latest_snapshot else None,
+        latest_snapshot.fingerprint if latest_snapshot else '',
+        timeout_seconds,
+        poll_interval_seconds,
+    )
 
     while True:
         attempt_count += 1
         payload = fetch_source_payload(force=True, use_cache=False)
+        payload_summary = summarize_payload(payload)
+        last_observed_payload = payload_summary
+        logger.info(
+            'merchant watch attempt=%s payload=%s',
+            attempt_count,
+            json.dumps(payload_summary, ensure_ascii=False, sort_keys=True),
+        )
         if latest_snapshot and latest_snapshot.fingerprint == payload['fingerprint']:
             if time.monotonic() - started_at >= timeout_seconds:
+                logger.info(
+                    'merchant watch timeout unchanged attempt_count=%s latest_fingerprint=%s last_payload=%s',
+                    attempt_count,
+                    latest_snapshot.fingerprint,
+                    json.dumps(last_observed_payload, ensure_ascii=False, sort_keys=True),
+                )
                 return {
                     'status': 'timeout',
                     'attemptCount': attempt_count,
                     'latestFingerprint': latest_snapshot.fingerprint,
+                    'lastObservedPayload': last_observed_payload,
                 }
+            time.sleep(max(poll_interval_seconds, 1))
+            continue
+
+        if not is_ready_snapshot_payload(payload):
+            if time.monotonic() - started_at >= timeout_seconds:
+                logger.info(
+                    'merchant watch timeout waiting_ready_payload attempt_count=%s last_payload=%s',
+                    attempt_count,
+                    json.dumps(last_observed_payload, ensure_ascii=False, sort_keys=True),
+                )
+                return {
+                    'status': 'timeout_waiting_ready_payload',
+                    'attemptCount': attempt_count,
+                    'latestFingerprint': latest_snapshot.fingerprint if latest_snapshot else '',
+                    'lastObservedPayload': last_observed_payload,
+                }
+            logger.info(
+                'merchant watch waiting for non-empty payload attempt=%s slot_date=%s round=%s fingerprint=%s',
+                attempt_count,
+                payload_summary['slotDate'],
+                payload_summary['round'],
+                payload_summary['fingerprint'],
+            )
             time.sleep(max(poll_interval_seconds, 1))
             continue
 
         with transaction.atomic():
             snapshot, created = create_snapshot_from_payload(payload)
+        logger.info(
+            'merchant watch snapshot ready snapshot_id=%s created=%s payload=%s',
+            snapshot.id,
+            created,
+            json.dumps(payload_summary, ensure_ascii=False, sort_keys=True),
+        )
         if not latest_snapshot:
             return {
                 'status': 'baseline_created',
