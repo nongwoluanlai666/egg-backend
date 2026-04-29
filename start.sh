@@ -10,7 +10,6 @@ import os
 import shlex
 
 keys = [
-    'PORT',
     'TZ',
     'MYSQL_ADDRESS',
     'MYSQL_DATABASE',
@@ -27,22 +26,24 @@ keys = [
     'MERCHANT_BACKUP_SOURCE_REFERER',
     'MERCHANT_BACKUP_SOURCE_API_KEY',
     'MERCHANT_NOTIFY_TEMPLATE_ID',
-    'MERCHANT_NOTIFY_PAGE',
     'MERCHANT_NOTIFY_SPECIAL_KEYWORDS',
     'MERCHANT_NOTIFY_DEFAULT_SELECTED_GOODS',
-    'MERCHANT_NOTIFY_JOB_TOKEN',
-    'MERCHANT_NOTIFY_JOB_URL',
     'MERCHANT_NOTIFY_FETCH_TIMEOUT_SECONDS',
     'MERCHANT_NOTIFY_POLL_TIMEOUT_SECONDS',
     'MERCHANT_NOTIFY_POLL_INTERVAL_SECONDS',
     'MERCHANT_NOTIFY_TRIGGER_GUARD_SECONDS',
     'MERCHANT_NOTICE_CACHE_TTL_SECONDS',
-    'MERCHANT_NOTICE_DAILY_REWARDED_STEP',
 ]
 
 with open('/app/cron.env', 'w', encoding='utf-8') as handle:
     for key in keys:
-        handle.write(f'export {key}={shlex.quote(os.environ.get(key, ""))}\n')
+        value = os.environ.get(key)
+        if value is None:
+            continue
+        value = str(value).strip()
+        if not value:
+            continue
+        handle.write(f'export {key}={shlex.quote(value)}\n')
 PY
 
 chmod 600 /app/cron.env
