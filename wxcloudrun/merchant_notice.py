@@ -51,6 +51,12 @@ _ACCESS_TOKEN_CACHE = {
     'token': '',
     'expires_at': 0.0,
 }
+GOODS_NAME_ALIASES = {
+    '炫彩蛋': '炫彩精灵蛋',
+}
+PUBLIC_GOODS_NAME_ALIASES = {
+    '炫彩精灵蛋': '炫彩蛋',
+}
 
 
 class MerchantNoticeError(Exception):
@@ -149,7 +155,29 @@ def get_special_keywords():
 
 
 def normalize_goods_name(value):
-    return normalize_text(value, 64)
+    normalized = normalize_text(value, 64)
+    if not normalized:
+        return ''
+    return GOODS_NAME_ALIASES.get(normalized, normalized)
+
+
+def export_goods_name(value):
+    normalized = normalize_text(value, 64)
+    if not normalized:
+        return ''
+    return PUBLIC_GOODS_NAME_ALIASES.get(normalized, normalized)
+
+
+def export_goods_names(items):
+    results = []
+    seen = set()
+    for item in items or []:
+        exported = export_goods_name(item)
+        if not exported or exported in seen:
+            continue
+        seen.add(exported)
+        results.append(exported)
+    return results
 
 
 def dedupe_goods_names(items):
@@ -289,7 +317,7 @@ def compute_payload_fingerprint(payload):
 
 
 def normalize_source_item(item):
-    name = normalize_text(item.get('name'), 64)
+    name = normalize_goods_name(item.get('name'))
     is_special = has_special_keyword(name)
     source_highlight = bool(item.get('is_highlight'))
     return {
@@ -310,7 +338,7 @@ def normalize_primary_source_payload(raw_payload):
     items = [
         normalize_source_item(item)
         for item in (raw_payload.get('items') or [])
-        if isinstance(item, dict) and normalize_text(item.get('name'), 64)
+        if isinstance(item, dict) and normalize_goods_name(item.get('name'))
     ]
     next_refresh_at = parse_next_refresh_at(raw_payload.get('next_refresh_ts'), slot_date, round_number)
     special_item_names = [item['name'] for item in items if item['isSpecial']]
@@ -348,7 +376,7 @@ def parse_backup_timestamp_ms(value):
 
 
 def normalize_backup_source_item(item):
-    name = normalize_text(item.get('name'), 64)
+    name = normalize_goods_name(item.get('name'))
     is_special = has_special_keyword(name)
     start_at = parse_backup_timestamp_ms(item.get('start_time'))
     end_at = parse_backup_timestamp_ms(item.get('end_time'))
@@ -928,11 +956,12 @@ def get_effective_selected_goods(record):
 
 
 def build_subscription_preferences(record):
-    selected_goods = get_effective_selected_goods(record)
+    selected_goods = export_goods_names(get_effective_selected_goods(record))
+    default_selected_goods = export_goods_names(get_default_selected_goods())
     return {
         'selectedGoods': selected_goods,
         'selectedGoodsCount': len(selected_goods),
-        'defaultSelectedGoods': get_default_selected_goods(),
+        'defaultSelectedGoods': default_selected_goods,
     }
 
 
@@ -1053,9 +1082,11 @@ def sanitize_current_payload_for_client(payload):
             continue
         sanitized_item = dict(item)
         sanitized_item.pop('image', None)
+        sanitized_item['name'] = export_goods_name(sanitized_item.get('name'))
         sanitized_items.append(sanitized_item)
 
     sanitized_payload['items'] = sanitized_items
+    sanitized_payload['specialItemNames'] = export_goods_names(sanitized_payload.get('specialItemNames') or [])
     return sanitized_payload
 
 
@@ -1077,7 +1108,7 @@ def build_current_response(openid=''):
         ),
         'isFallbackData': bool(is_fallback_data),
         'specialKeywords': get_special_keywords(),
-        'defaultSelectedGoods': get_default_selected_goods(),
+        'defaultSelectedGoods': export_goods_names(get_default_selected_goods()),
         'current': payload,
         'subscription': build_subscription_state(subscription),
     }
@@ -1374,7 +1405,11 @@ def build_notice_advice_text(action_text, remaining_count):
 
 
 def build_special_item_summary(names):
-    normalized_names = [normalize_text(name, 20) for name in names if normalize_text(name, 20)]
+    normalized_names = [
+        normalize_text(name, 20)
+        for name in export_goods_names(names)
+        if normalize_text(name, 20)
+    ]
     if not normalized_names:
         return '检测到珍贵货物'
     joined = '、'.join(normalized_names)
