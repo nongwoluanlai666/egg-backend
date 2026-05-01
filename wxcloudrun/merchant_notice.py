@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import logging
+import threading
 import time
 from datetime import date, datetime, time as dt_time, timedelta, timezone as dt_timezone
 from urllib.parse import urljoin
@@ -31,7 +32,7 @@ DEV_SELF_TEST_ACTION = '返回蛋查查'
 ROUND_START_HOURS = (8, 12, 16, 20)
 MERCHANT_SOURCE_PRIMARY = 'primary'
 MERCHANT_SOURCE_BACKUP = 'backup'
-WECHAT_TOKEN_URL = 'https://api.weixin.qq.com/cgi-bin/token'
+WECHAT_STABLE_TOKEN_URL = 'https://api.weixin.qq.com/cgi-bin/stable_token'
 WECHAT_SUBSCRIBE_SEND_URL = 'https://api.weixin.qq.com/cgi-bin/message/subscribe/send'
 WATCH_JOB_KEY = 'merchant_watch'
 MANUAL_SNAPSHOT_FINGERPRINT_PREFIX = 'manual-'
@@ -51,12 +52,14 @@ _ACCESS_TOKEN_CACHE = {
     'token': '',
     'expires_at': 0.0,
 }
+_ACCESS_TOKEN_CACHE_LOCK = threading.Lock()
 GOODS_NAME_ALIASES = {
     '炫彩蛋': '炫彩精灵蛋',
 }
 PUBLIC_GOODS_NAME_ALIASES = {
     '炫彩精灵蛋': '炫彩蛋',
 }
+WECHAT_ACCESS_TOKEN_RETRYABLE_ERROR_CODES = {'40001', '40014', '42001'}
 
 
 class MerchantNoticeError(Exception):
@@ -1360,33 +1363,67 @@ def build_wechat_access_token():
     if _ACCESS_TOKEN_CACHE['token'] and _ACCESS_TOKEN_CACHE['expires_at'] > time.monotonic():
         return _ACCESS_TOKEN_CACHE['token']
 
+    with _ACCESS_TOKEN_CACHE_LOCK:
+        if _ACCESS_TOKEN_CACHE['token'] and _ACCESS_TOKEN_CACHE['expires_at'] > time.monotonic():
+            return _ACCESS_TOKEN_CACHE['token']
+
+        try:
+            response = requests.post(
+                WECHAT_STABLE_TOKEN_URL,
+                json={
+                    'grant_type': 'client_credential',
+                    'appid': appid,
+                    'secret': secret,
+                    'force_refresh': False,
+                },
+                timeout=float(getattr(settings, 'MERCHANT_NOTIFY_FETCH_TIMEOUT_SECONDS', 8)),
+                verify=False,
+            )
+        except requests.RequestException as error:
+            raise MerchantNoticeSourceError(f'微信 access_token 获取失败: {error}') from error
+
+        try:
+            data = response.json()
+        except ValueError as error:
+            raise MerchantNoticeSourceError('微信 access_token 接口返回了非 JSON 数据') from error
+
+        token = normalize_text(data.get('access_token'), 512)
+        if not token:
+            raise MerchantNoticeSourceError(f'微信 access_token 获取失败: {data}')
+
+        expires_in = max(parse_int(data.get('expires_in') or data.get('expire_in'), 7200), 120)
+        _ACCESS_TOKEN_CACHE['token'] = token
+        _ACCESS_TOKEN_CACHE['expires_at'] = time.monotonic() + max(expires_in - 120, 60)
+        return token
+
+
+def clear_wechat_access_token_cache():
+    with _ACCESS_TOKEN_CACHE_LOCK:
+        _ACCESS_TOKEN_CACHE['token'] = ''
+        _ACCESS_TOKEN_CACHE['expires_at'] = 0.0
+
+
+def should_retry_with_refreshed_access_token(error_code):
+    return str(error_code or '').strip() in WECHAT_ACCESS_TOKEN_RETRYABLE_ERROR_CODES
+
+
+def post_wechat_subscribe_message(request_payload):
+    access_token = build_wechat_access_token()
     try:
-        response = requests.get(
-            WECHAT_TOKEN_URL,
-            params={
-                'grant_type': 'client_credential',
-                'appid': appid,
-                'secret': secret,
-            },
+        response = requests.post(
+            WECHAT_SUBSCRIBE_SEND_URL,
+            params={'access_token': access_token},
+            json=request_payload,
             timeout=float(getattr(settings, 'MERCHANT_NOTIFY_FETCH_TIMEOUT_SECONDS', 8)),
             verify=False,
         )
     except requests.RequestException as error:
-        raise MerchantNoticeSourceError(f'微信 access_token 获取失败: {error}') from error
+        raise MerchantNoticeSourceError(f'微信订阅消息发送失败: {error}') from error
 
     try:
-        data = response.json()
+        return response.json()
     except ValueError as error:
-        raise MerchantNoticeSourceError('微信 access_token 接口返回了非 JSON 数据') from error
-
-    token = normalize_text(data.get('access_token'), 512)
-    if not token:
-        raise MerchantNoticeSourceError(f'微信 access_token 获取失败: {data}')
-
-    expires_in = max(parse_int(data.get('expires_in'), 7200), 120)
-    _ACCESS_TOKEN_CACHE['token'] = token
-    _ACCESS_TOKEN_CACHE['expires_at'] = time.monotonic() + max(expires_in - 120, 60)
-    return token
+        raise MerchantNoticeSourceError('微信订阅消息发送接口返回了非 JSON 数据') from error
 
 
 def truncate_text(value, max_length):
@@ -1557,22 +1594,20 @@ def send_subscribe_message(subscription, snapshot, message_body=None, special_it
         snapshot,
         matched_item_names=special_item_names,
     )
-    access_token = build_wechat_access_token()
-    try:
-        response = requests.post(
-            WECHAT_SUBSCRIBE_SEND_URL,
-            params={'access_token': access_token},
-            json=request_payload,
-            timeout=float(getattr(settings, 'MERCHANT_NOTIFY_FETCH_TIMEOUT_SECONDS', 8)),
-            verify=False,
-        )
-    except requests.RequestException as error:
-        raise MerchantNoticeSourceError(f'微信订阅消息发送失败: {error}') from error
+    data = post_wechat_subscribe_message(request_payload)
 
-    try:
-        data = response.json()
-    except ValueError as error:
-        raise MerchantNoticeSourceError('微信订阅消息发送接口返回了非 JSON 数据') from error
+    errcode = str(data.get('errcode', ''))
+    errmsg = normalize_text(data.get('errmsg'), 255)
+    if should_retry_with_refreshed_access_token(errcode):
+        logger.warning(
+            'merchant notice send will retry with refreshed access token subscription_id=%s snapshot_id=%s errcode=%s errmsg=%s',
+            subscription.id,
+            snapshot.id,
+            errcode,
+            errmsg,
+        )
+        clear_wechat_access_token_cache()
+        data = post_wechat_subscribe_message(request_payload)
 
     errcode = str(data.get('errcode', ''))
     errmsg = normalize_text(data.get('errmsg'), 255)
@@ -1783,6 +1818,17 @@ def get_dispatch_worker_stale_seconds():
     return max(parse_int(getattr(settings, 'MERCHANT_NOTICE_DISPATCH_WORKER_STALE_SECONDS', 600), 600), 60)
 
 
+def get_dispatch_worker_heartbeat_seconds():
+    return max(
+        float(getattr(settings, 'MERCHANT_NOTICE_DISPATCH_WORKER_HEARTBEAT_SECONDS', 15) or 15),
+        5,
+    )
+
+
+def get_dispatch_worker_progress_batch_size():
+    return max(parse_int(getattr(settings, 'MERCHANT_NOTICE_DISPATCH_PROGRESS_BATCH_SIZE', 50), 50), 1)
+
+
 def enqueue_dispatch_job(job_key, job_type, snapshot=None, payload=None, target_count=0):
     now = make_naive_local(get_local_now())
     payload_json = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True)
@@ -1856,6 +1902,45 @@ def finalize_dispatch_job(job, status, target_count, success_count, failed_count
     return serialize_dispatch_job(job)
 
 
+def heartbeat_dispatch_job(job, target_count, success_count, failed_count, skipped_count, force=False):
+    if not job:
+        return
+
+    processed_count = (
+        max(parse_int(success_count, 0), 0)
+        + max(parse_int(failed_count, 0), 0)
+        + max(parse_int(skipped_count, 0), 0)
+    )
+    now_monotonic = time.monotonic()
+    next_heartbeat_monotonic = float(getattr(job, '_next_heartbeat_monotonic', 0.0) or 0.0)
+    should_flush = force or processed_count <= 0
+
+    if not should_flush and processed_count % get_dispatch_worker_progress_batch_size() == 0:
+        should_flush = True
+    if not should_flush and now_monotonic >= next_heartbeat_monotonic:
+        should_flush = True
+    if not should_flush:
+        return
+
+    now = make_naive_local(get_local_now())
+    MerchantNoticeDispatchJob.objects.filter(
+        id=job.id,
+        status=MerchantNoticeDispatchJob.STATUS_RUNNING,
+    ).update(
+        target_count=max(parse_int(target_count, 0), 0),
+        success_count=max(parse_int(success_count, 0), 0),
+        failed_count=max(parse_int(failed_count, 0), 0),
+        skipped_count=max(parse_int(skipped_count, 0), 0),
+        updated_at=now,
+    )
+    job.target_count = max(parse_int(target_count, 0), 0)
+    job.success_count = max(parse_int(success_count, 0), 0)
+    job.failed_count = max(parse_int(failed_count, 0), 0)
+    job.skipped_count = max(parse_int(skipped_count, 0), 0)
+    job.updated_at = now
+    job._next_heartbeat_monotonic = now_monotonic + get_dispatch_worker_heartbeat_seconds()
+
+
 def process_dispatch_job(job):
     if not job:
         return {'status': 'idle'}
@@ -1866,11 +1951,13 @@ def process_dispatch_job(job):
     skipped_count = 0
     last_error = ''
     target_count = 0
+    job._next_heartbeat_monotonic = time.monotonic() + get_dispatch_worker_heartbeat_seconds()
 
     try:
         if job.job_type == MerchantNoticeDispatchJob.JOB_TYPE_MANUAL:
             message_payload = payload.get('message') if isinstance(payload.get('message'), dict) else {}
             target_count = get_dispatchable_subscription_queryset().count()
+            heartbeat_dispatch_job(job, target_count, success_count, failed_count, skipped_count, force=True)
             for subscription in get_dispatchable_subscription_queryset().iterator(chunk_size=100):
                 message_body = build_manual_subscribe_message_body(subscription, message_payload)
                 result = send_subscribe_message(
@@ -1886,6 +1973,7 @@ def process_dispatch_job(job):
                 else:
                     failed_count += 1
                     last_error = result.get('errorMessage') or result.get('errorCode') or last_error
+                heartbeat_dispatch_job(job, target_count, success_count, failed_count, skipped_count)
         else:
             target_count = 0
             for subscription, matched_names in iter_snapshot_dispatch_targets(job.snapshot):
@@ -1902,6 +1990,7 @@ def process_dispatch_job(job):
                 else:
                     failed_count += 1
                     last_error = result.get('errorMessage') or result.get('errorCode') or last_error
+                heartbeat_dispatch_job(job, target_count, success_count, failed_count, skipped_count)
     except Exception as error:
         last_error = str(error)
         return finalize_dispatch_job(
@@ -1934,7 +2023,7 @@ def claim_next_dispatch_job():
     with transaction.atomic():
         MerchantNoticeDispatchJob.objects.filter(
             status=MerchantNoticeDispatchJob.STATUS_RUNNING,
-            started_at__lt=stale_before,
+            updated_at__lt=stale_before,
         ).update(
             status=MerchantNoticeDispatchJob.STATUS_PENDING,
             started_at=None,
