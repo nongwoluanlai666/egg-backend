@@ -569,98 +569,20 @@ def fetch_source_payload_from_priority(source_name):
     raise MerchantNoticeSourceError(f'未知的远行商人数据源: {source_name}')
 
 
-def is_ready_snapshot_payload(payload):
-    return len(payload.get('items') or []) > 0
-
-
-def get_payload_round_marker(payload):
-    if not isinstance(payload, dict):
-        return None
-    return (
-        parse_slot_date(payload.get('slotDate')),
-        max(parse_int(payload.get('round'), 0), 0),
-    )
-
-
-def get_snapshot_round_marker(snapshot):
-    if not snapshot:
-        return None
-    return (
-        snapshot.slot_date,
-        max(parse_int(snapshot.round, 0), 0),
-    )
-
-
-def is_payload_newer_round_than_snapshot(payload, snapshot):
-    payload_marker = get_payload_round_marker(payload)
-    snapshot_marker = get_snapshot_round_marker(snapshot)
-    if not payload_marker or not snapshot_marker:
-        return False
-    return payload_marker > snapshot_marker
-
-
-def is_payload_changed_from_snapshot(payload, snapshot):
-    payload_fingerprint = normalize_text((payload or {}).get('fingerprint'), 64)
-    if not payload_fingerprint:
-        return False
-    if not snapshot:
-        return True
-    return payload_fingerprint != normalize_text(snapshot.fingerprint, 64)
-
-
-def should_probe_next_source(payload, latest_snapshot=None):
-    if not is_ready_snapshot_payload(payload):
-        return True
-    return not is_payload_changed_from_snapshot(payload, latest_snapshot)
-
-
-def rank_source_payload(payload, latest_snapshot=None):
-    ready = is_ready_snapshot_payload(payload)
-    changed = is_payload_changed_from_snapshot(payload, latest_snapshot)
-    newer_round = is_payload_newer_round_than_snapshot(payload, latest_snapshot)
-    return (
-        1 if ready and newer_round else 0,
-        1 if ready and changed else 0,
-        1 if ready else 0,
-        1 if changed else 0,
-    )
-
-
-def fetch_source_payload(force=False, use_cache=True, latest_snapshot=None):
+def fetch_source_payload(force=False, use_cache=True):
     cache_ttl = max(int(getattr(settings, 'MERCHANT_NOTICE_CACHE_TTL_SECONDS', 30) or 30), 0)
     if use_cache and not force and _CURRENT_PAYLOAD_CACHE['payload'] and _CURRENT_PAYLOAD_CACHE['expires_at'] > time.monotonic():
         return copy.deepcopy(_CURRENT_PAYLOAD_CACHE['payload'])
 
     errors = []
-    best_payload = None
-    best_rank = (-1, -1, -1, -1)
     for source_name in get_merchant_source_priority_list():
         try:
             normalized = fetch_source_payload_from_priority(source_name)
-            payload_rank = rank_source_payload(normalized, latest_snapshot=latest_snapshot)
-            if best_payload is None or payload_rank > best_rank:
-                best_payload = normalized
-                best_rank = payload_rank
-            if should_probe_next_source(normalized, latest_snapshot=latest_snapshot):
-                logger.info(
-                    'merchant source payload requires fallback probe source=%s ready=%s changed=%s newer_round=%s fingerprint=%s',
-                    source_name,
-                    is_ready_snapshot_payload(normalized),
-                    is_payload_changed_from_snapshot(normalized, latest_snapshot),
-                    is_payload_newer_round_than_snapshot(normalized, latest_snapshot),
-                    normalize_text(normalized.get('fingerprint'), 64),
-                )
-                continue
             _CURRENT_PAYLOAD_CACHE['payload'] = copy.deepcopy(normalized)
             _CURRENT_PAYLOAD_CACHE['expires_at'] = time.monotonic() + cache_ttl
             return normalized
         except MerchantNoticeSourceError as error:
             errors.append(f'{source_name}: {error}')
-
-    if best_payload is not None:
-        _CURRENT_PAYLOAD_CACHE['payload'] = copy.deepcopy(best_payload)
-        _CURRENT_PAYLOAD_CACHE['expires_at'] = time.monotonic() + cache_ttl
-        return best_payload
 
     raise MerchantNoticeSourceError('；'.join(errors) if errors else '远行商人数据源全部请求失败')
 
@@ -713,6 +635,10 @@ def summarize_payload(payload):
         'sourceUpdatedAt': normalize_text(payload.get('sourceUpdatedAt'), 32),
         'fingerprint': normalize_text(payload.get('fingerprint'), 64),
     }
+
+
+def is_ready_snapshot_payload(payload):
+    return len(payload.get('items') or []) > 0
 
 
 def get_latest_snapshot(include_manual=False):
@@ -797,11 +723,7 @@ def finish_watch_job_run(status, result):
 def get_current_payload_for_display():
     latest_snapshot = get_latest_snapshot()
     try:
-        current_payload = fetch_source_payload(
-            force=False,
-            use_cache=True,
-            latest_snapshot=latest_snapshot,
-        )
+        current_payload = fetch_source_payload(force=False, use_cache=True)
         return current_payload, False
     except MerchantNoticeSourceError:
         if latest_snapshot:
@@ -2061,11 +1983,7 @@ def watch_current_merchant(timeout_seconds=None, poll_interval_seconds=None):
 
     while True:
         attempt_count += 1
-        payload = fetch_source_payload(
-            force=True,
-            use_cache=False,
-            latest_snapshot=latest_snapshot,
-        )
+        payload = fetch_source_payload(force=True, use_cache=False)
         payload_summary = summarize_payload(payload)
         last_observed_payload = payload_summary
         logger.info(
