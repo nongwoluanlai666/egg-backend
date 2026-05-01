@@ -915,12 +915,43 @@ def parse_merchant_notice_broadcast_payload(data):
     )
     campaign_key = normalize_text(data.get('campaignKey') or data.get('campaign_key'), 64)
     template_id = normalize_text(data.get('templateId') or data.get('template_id'), 128)
+    start_subscription_id = None
+    end_subscription_id = None
+    exclude_success_snapshot_id = None
 
     dry_run = False
     if 'dryRun' in data:
         dry_run = parse_boolean(data.get('dryRun'))
     elif 'dry_run' in data:
         dry_run = parse_boolean(data.get('dry_run'))
+
+    raw_start_subscription_id = (
+        data.get('startSubscriptionId')
+        if 'startSubscriptionId' in data
+        else data.get('start_subscription_id')
+    )
+    if raw_start_subscription_id not in (None, ''):
+        start_subscription_id = parse_int_field(raw_start_subscription_id, 'startSubscriptionId', minimum=1)
+
+    raw_end_subscription_id = (
+        data.get('endSubscriptionId')
+        if 'endSubscriptionId' in data
+        else data.get('end_subscription_id')
+    )
+    if raw_end_subscription_id not in (None, ''):
+        end_subscription_id = parse_int_field(raw_end_subscription_id, 'endSubscriptionId', minimum=1)
+
+    raw_exclude_success_snapshot_id = (
+        data.get('excludeSuccessSnapshotId')
+        if 'excludeSuccessSnapshotId' in data
+        else data.get('exclude_success_snapshot_id')
+    )
+    if raw_exclude_success_snapshot_id not in (None, ''):
+        exclude_success_snapshot_id = parse_int_field(
+            raw_exclude_success_snapshot_id,
+            'excludeSuccessSnapshotId',
+            minimum=1,
+        )
 
     if not date_text:
         raise ValidationError('缺少 date2')
@@ -930,6 +961,12 @@ def parse_merchant_notice_broadcast_payload(data):
         raise ValidationError('缺少 thing10')
     if miniprogram_state and miniprogram_state not in {'developer', 'trial', 'formal'}:
         raise ValidationError('miniprogramState 参数错误')
+    if (
+        start_subscription_id is not None
+        and end_subscription_id is not None
+        and start_subscription_id > end_subscription_id
+    ):
+        raise ValidationError('startSubscriptionId 不能大于 endSubscriptionId')
 
     return {
         'date2': date_text,
@@ -940,6 +977,9 @@ def parse_merchant_notice_broadcast_payload(data):
         'campaignKey': campaign_key,
         'templateId': template_id,
         'dryRun': dry_run,
+        'startSubscriptionId': start_subscription_id,
+        'endSubscriptionId': end_subscription_id,
+        'excludeSuccessSnapshotId': exclude_success_snapshot_id,
     }
 
 

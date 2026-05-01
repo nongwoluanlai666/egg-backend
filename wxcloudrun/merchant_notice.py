@@ -5,13 +5,14 @@ import json
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, time as dt_time, timedelta, timezone as dt_timezone
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import requests
 from django.conf import settings
-from django.db import transaction
+from django.db import close_old_connections, transaction
 
 from wxcloudrun.models import (
     MerchantNoticeDispatchJob,
@@ -1407,23 +1408,46 @@ def should_retry_with_refreshed_access_token(error_code):
     return str(error_code or '').strip() in WECHAT_ACCESS_TOKEN_RETRYABLE_ERROR_CODES
 
 
+def get_wechat_send_retry_count():
+    return max(parse_int(getattr(settings, 'MERCHANT_NOTIFY_SEND_RETRY_COUNT', 2), 2), 0)
+
+
+def get_wechat_send_retry_delay_seconds():
+    return max(float(getattr(settings, 'MERCHANT_NOTIFY_SEND_RETRY_DELAY_SECONDS', 1.5) or 1.5), 0.1)
+
+
 def post_wechat_subscribe_message(request_payload):
     access_token = build_wechat_access_token()
-    try:
-        response = requests.post(
-            WECHAT_SUBSCRIBE_SEND_URL,
-            params={'access_token': access_token},
-            json=request_payload,
-            timeout=float(getattr(settings, 'MERCHANT_NOTIFY_FETCH_TIMEOUT_SECONDS', 8)),
-            verify=False,
-        )
-    except requests.RequestException as error:
-        raise MerchantNoticeSourceError(f'微信订阅消息发送失败: {error}') from error
+    retry_count = get_wechat_send_retry_count()
+    retry_delay_seconds = get_wechat_send_retry_delay_seconds()
+    last_error = None
 
-    try:
-        return response.json()
-    except ValueError as error:
-        raise MerchantNoticeSourceError('微信订阅消息发送接口返回了非 JSON 数据') from error
+    for attempt in range(retry_count + 1):
+        try:
+            response = requests.post(
+                WECHAT_SUBSCRIBE_SEND_URL,
+                params={'access_token': access_token},
+                json=request_payload,
+                timeout=float(getattr(settings, 'MERCHANT_NOTIFY_FETCH_TIMEOUT_SECONDS', 8)),
+                verify=False,
+            )
+            try:
+                return response.json()
+            except ValueError as error:
+                raise MerchantNoticeSourceError('微信订阅消息发送接口返回了非 JSON 数据') from error
+        except requests.RequestException as error:
+            last_error = error
+            if attempt >= retry_count:
+                break
+            logger.warning(
+                'merchant notice send request retry attempt=%s/%s error=%s',
+                attempt + 1,
+                retry_count + 1,
+                error,
+            )
+            time.sleep(retry_delay_seconds * (attempt + 1))
+
+    raise MerchantNoticeSourceError(f'微信订阅消息发送失败: {last_error}') from last_error
 
 
 def truncate_text(value, max_length):
@@ -1498,6 +1522,87 @@ def get_dispatchable_subscription_queryset():
 
 def get_dispatchable_subscriptions():
     return list(get_dispatchable_subscription_queryset())
+
+
+def build_manual_dispatch_filter_summary(payload):
+    filters = payload if isinstance(payload, dict) else {}
+    start_subscription_id = max(parse_int(filters.get('startSubscriptionId'), 0), 0)
+    end_subscription_id = max(parse_int(filters.get('endSubscriptionId'), 0), 0)
+    exclude_success_snapshot_id = max(parse_int(filters.get('excludeSuccessSnapshotId'), 0), 0)
+    return {
+        'startSubscriptionId': start_subscription_id or None,
+        'endSubscriptionId': end_subscription_id or None,
+        'excludeSuccessSnapshotId': exclude_success_snapshot_id or None,
+    }
+
+
+def get_manual_dispatch_queryset(payload=None):
+    filter_summary = build_manual_dispatch_filter_summary(payload)
+    queryset = get_dispatchable_subscription_queryset()
+
+    if filter_summary['startSubscriptionId']:
+        queryset = queryset.filter(id__gte=filter_summary['startSubscriptionId'])
+    if filter_summary['endSubscriptionId']:
+        queryset = queryset.filter(id__lte=filter_summary['endSubscriptionId'])
+    if filter_summary['excludeSuccessSnapshotId']:
+        successful_subscription_ids = MerchantNoticeSendLog.objects.filter(
+            snapshot_id=filter_summary['excludeSuccessSnapshotId'],
+            status=MerchantNoticeSendLog.STATUS_SUCCESS,
+        ).values('subscription_id')
+        queryset = queryset.exclude(id__in=successful_subscription_ids)
+
+    return queryset
+
+
+def build_manual_dispatch_targets(payload=None):
+    message_payload = payload if isinstance(payload, dict) else {}
+    subscription_ids = list(get_manual_dispatch_queryset(message_payload).values_list('id', flat=True))
+    return [
+        {
+            'subscriptionId': subscription_id,
+            'messagePayload': message_payload,
+        }
+        for subscription_id in subscription_ids
+    ]
+
+
+def build_snapshot_dispatch_targets(snapshot):
+    targets = []
+    for subscription, matched_names in iter_snapshot_dispatch_targets(snapshot):
+        targets.append({
+            'subscriptionId': subscription.id,
+            'matchedNames': matched_names,
+        })
+    return targets
+
+
+def split_dispatch_targets(targets, shard_count):
+    normalized_targets = list(targets or [])
+    if not normalized_targets:
+        return []
+
+    normalized_shard_count = max(min(parse_int(shard_count, 1), len(normalized_targets)), 1)
+    shards = [[] for _ in range(normalized_shard_count)]
+    for index, target in enumerate(normalized_targets):
+        shards[index % normalized_shard_count].append(target)
+    return [shard for shard in shards if shard]
+
+
+def is_wechat_gateway_request_error_message(error_message):
+    normalized = normalize_text(error_message, 512)
+    if not normalized:
+        return False
+    return (
+        'api.weixin.qq.com' in normalized
+        and (
+            'port=443' in normalized
+            or 'HTTPSConnectionPool' in normalized
+            or 'Failed to establish a new connection' in normalized
+            or 'Read timed out' in normalized
+            or 'ConnectTimeout' in normalized
+            or 'Connection reset' in normalized
+        )
+    )
 
 
 def iter_snapshot_dispatch_targets(snapshot):
@@ -1818,6 +1923,10 @@ def get_dispatch_worker_stale_seconds():
     return max(parse_int(getattr(settings, 'MERCHANT_NOTICE_DISPATCH_WORKER_STALE_SECONDS', 600), 600), 60)
 
 
+def get_dispatch_worker_concurrency():
+    return max(parse_int(getattr(settings, 'MERCHANT_NOTICE_DISPATCH_CONCURRENCY', 10), 10), 1)
+
+
 def get_dispatch_worker_heartbeat_seconds():
     return max(
         float(getattr(settings, 'MERCHANT_NOTICE_DISPATCH_WORKER_HEARTBEAT_SECONDS', 15) or 15),
@@ -1827,6 +1936,14 @@ def get_dispatch_worker_heartbeat_seconds():
 
 def get_dispatch_worker_progress_batch_size():
     return max(parse_int(getattr(settings, 'MERCHANT_NOTICE_DISPATCH_PROGRESS_BATCH_SIZE', 50), 50), 1)
+
+
+def get_wechat_gateway_retry_delay_seconds():
+    return max(float(getattr(settings, 'MERCHANT_NOTICE_WECHAT_443_RETRY_DELAY_SECONDS', 3) or 3), 0.1)
+
+
+def get_wechat_gateway_refresh_threshold():
+    return max(parse_int(getattr(settings, 'MERCHANT_NOTICE_WECHAT_443_REFRESH_THRESHOLD', 3), 3), 1)
 
 
 def enqueue_dispatch_job(job_key, job_type, snapshot=None, payload=None, target_count=0):
@@ -1941,56 +2058,245 @@ def heartbeat_dispatch_job(job, target_count, success_count, failed_count, skipp
     job._next_heartbeat_monotonic = now_monotonic + get_dispatch_worker_heartbeat_seconds()
 
 
+class DispatchProgressTracker:
+    def __init__(self, job, target_count):
+        self.job = job
+        self.target_count = max(parse_int(target_count, 0), 0)
+        self.success_count = 0
+        self.failed_count = 0
+        self.skipped_count = 0
+        self.last_error = ''
+        self._lock = threading.Lock()
+        self.job._next_heartbeat_monotonic = time.monotonic() + get_dispatch_worker_heartbeat_seconds()
+        heartbeat_dispatch_job(self.job, self.target_count, 0, 0, 0, force=True)
+
+    def record_success(self):
+        self._record(success_delta=1)
+
+    def record_skipped(self):
+        self._record(skipped_delta=1)
+
+    def record_failure(self, error_message=''):
+        self._record(failed_delta=1, error_message=error_message)
+
+    def flush(self, force=False):
+        with self._lock:
+            heartbeat_dispatch_job(
+                self.job,
+                self.target_count,
+                self.success_count,
+                self.failed_count,
+                self.skipped_count,
+                force=force,
+            )
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                'targetCount': self.target_count,
+                'successCount': self.success_count,
+                'failedCount': self.failed_count,
+                'skippedCount': self.skipped_count,
+                'lastError': self.last_error,
+            }
+
+    def _record(self, success_delta=0, failed_delta=0, skipped_delta=0, error_message=''):
+        with self._lock:
+            self.success_count += max(parse_int(success_delta, 0), 0)
+            self.failed_count += max(parse_int(failed_delta, 0), 0)
+            self.skipped_count += max(parse_int(skipped_delta, 0), 0)
+            if error_message:
+                self.last_error = normalize_text(error_message, 255)
+            heartbeat_dispatch_job(
+                self.job,
+                self.target_count,
+                self.success_count,
+                self.failed_count,
+                self.skipped_count,
+            )
+
+
+def load_dispatch_subscription(subscription_id):
+    normalized_id = parse_int(subscription_id, 0)
+    if normalized_id <= 0:
+        return None
+    return MerchantNoticeSubscription.objects.filter(id=normalized_id).first()
+
+
+def send_dispatch_target(subscription, snapshot, target):
+    if not subscription:
+        return {
+            'status': 'skipped',
+            'reason': 'missing_subscription',
+        }
+
+    if target.get('messagePayload'):
+        message_payload = target['messagePayload']
+        message_body = build_manual_subscribe_message_body(subscription, message_payload)
+        return send_subscribe_message(
+            subscription,
+            snapshot,
+            message_body=message_body,
+            special_item_names=message_payload.get('thing7'),
+        )
+
+    return send_subscribe_message(
+        subscription,
+        snapshot,
+        special_item_names=target.get('matchedNames') or [],
+    )
+
+
+def send_dispatch_target_with_recovery(subscription, snapshot, target, worker_state):
+    try:
+        result = send_dispatch_target(subscription, snapshot, target)
+        worker_state['consecutive_gateway_errors'] = 0
+        return result
+    except MerchantNoticeSourceError as error:
+        error_message = str(error)
+        if not is_wechat_gateway_request_error_message(error_message):
+            worker_state['consecutive_gateway_errors'] = 0
+            raise
+
+        worker_state['consecutive_gateway_errors'] += 1
+        if worker_state['consecutive_gateway_errors'] >= get_wechat_gateway_refresh_threshold():
+            clear_wechat_access_token_cache()
+            logger.warning(
+                'merchant dispatch worker refreshing access token after consecutive gateway failures subscription_id=%s snapshot_id=%s failures=%s',
+                getattr(subscription, 'id', 0),
+                getattr(snapshot, 'id', 0),
+                worker_state['consecutive_gateway_errors'],
+            )
+            worker_state['consecutive_gateway_errors'] = 0
+
+        delay_seconds = get_wechat_gateway_retry_delay_seconds()
+        logger.warning(
+            'merchant dispatch worker retrying after gateway failure subscription_id=%s snapshot_id=%s delay_seconds=%s error=%s',
+            getattr(subscription, 'id', 0),
+            getattr(snapshot, 'id', 0),
+            delay_seconds,
+            error_message,
+        )
+        time.sleep(delay_seconds)
+        try:
+            retry_result = send_dispatch_target(subscription, snapshot, target)
+        except MerchantNoticeSourceError as retry_error:
+            if is_wechat_gateway_request_error_message(str(retry_error)):
+                worker_state['consecutive_gateway_errors'] += 1
+            else:
+                worker_state['consecutive_gateway_errors'] = 0
+            raise
+        worker_state['consecutive_gateway_errors'] = 0
+        return retry_result
+
+
+def process_dispatch_target_slice(job, snapshot, targets, progress_tracker):
+    close_old_connections()
+    worker_state = {
+        'consecutive_gateway_errors': 0,
+    }
+    last_error = ''
+
+    try:
+        for target in targets:
+            subscription = load_dispatch_subscription(target.get('subscriptionId'))
+            if not subscription:
+                progress_tracker.record_skipped()
+                worker_state['consecutive_gateway_errors'] = 0
+                continue
+
+            try:
+                result = send_dispatch_target_with_recovery(subscription, snapshot, target, worker_state)
+                if result['status'] == 'success':
+                    progress_tracker.record_success()
+                elif result['status'] == 'skipped':
+                    progress_tracker.record_skipped()
+                else:
+                    error_message = result.get('errorMessage') or result.get('errorCode') or ''
+                    progress_tracker.record_failure(error_message)
+                    last_error = error_message or last_error
+            except MerchantNoticeSourceError as error:
+                last_error = str(error)
+                progress_tracker.record_failure(last_error)
+                logger.warning(
+                    'merchant concurrent dispatch source failure subscription_id=%s snapshot_id=%s error=%s',
+                    subscription.id,
+                    getattr(snapshot, 'id', 0),
+                    error,
+                )
+            except Exception as error:
+                last_error = str(error)
+                progress_tracker.record_failure(last_error)
+                logger.exception(
+                    'merchant concurrent dispatch unexpected failure subscription_id=%s snapshot_id=%s',
+                    subscription.id,
+                    getattr(snapshot, 'id', 0),
+                )
+    finally:
+        close_old_connections()
+
+    return {
+        'lastError': last_error,
+        'processedCount': len(targets),
+    }
+
+
+def process_dispatch_targets_concurrently(job, snapshot, targets):
+    target_list = list(targets or [])
+    progress_tracker = DispatchProgressTracker(job, len(target_list))
+    if not target_list:
+        return progress_tracker.snapshot()
+
+    concurrency = min(get_dispatch_worker_concurrency(), len(target_list))
+    target_slices = split_dispatch_targets(target_list, concurrency)
+    future_results = []
+
+    with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix='merchant-dispatch') as executor:
+        futures = [
+            executor.submit(process_dispatch_target_slice, job, snapshot, target_slice, progress_tracker)
+            for target_slice in target_slices
+        ]
+        for future in futures:
+            future_results.append(future.result())
+
+    progress_tracker.flush(force=True)
+    summary = progress_tracker.snapshot()
+    for future_result in future_results:
+        if future_result.get('lastError'):
+            summary['lastError'] = future_result['lastError']
+    return summary
+
+
 def process_dispatch_job(job):
     if not job:
         return {'status': 'idle'}
 
     payload = parse_dispatch_job_payload(job.payload_json)
+    last_error = ''
+    target_count = 0
     success_count = 0
     failed_count = 0
     skipped_count = 0
-    last_error = ''
-    target_count = 0
-    job._next_heartbeat_monotonic = time.monotonic() + get_dispatch_worker_heartbeat_seconds()
 
     try:
         if job.job_type == MerchantNoticeDispatchJob.JOB_TYPE_MANUAL:
             message_payload = payload.get('message') if isinstance(payload.get('message'), dict) else {}
-            target_count = get_dispatchable_subscription_queryset().count()
-            heartbeat_dispatch_job(job, target_count, success_count, failed_count, skipped_count, force=True)
-            for subscription in get_dispatchable_subscription_queryset().iterator(chunk_size=100):
-                message_body = build_manual_subscribe_message_body(subscription, message_payload)
-                result = send_subscribe_message(
-                    subscription,
-                    job.snapshot,
-                    message_body=message_body,
-                    special_item_names=message_payload.get('thing7'),
-                )
-                if result['status'] == 'success':
-                    success_count += 1
-                elif result['status'] == 'skipped':
-                    skipped_count += 1
-                else:
-                    failed_count += 1
-                    last_error = result.get('errorMessage') or result.get('errorCode') or last_error
-                heartbeat_dispatch_job(job, target_count, success_count, failed_count, skipped_count)
+            summary = process_dispatch_targets_concurrently(
+                job,
+                job.snapshot,
+                build_manual_dispatch_targets(message_payload),
+            )
         else:
-            target_count = 0
-            for subscription, matched_names in iter_snapshot_dispatch_targets(job.snapshot):
-                target_count += 1
-                result = send_subscribe_message(
-                    subscription,
-                    job.snapshot,
-                    special_item_names=matched_names,
-                )
-                if result['status'] == 'success':
-                    success_count += 1
-                elif result['status'] == 'skipped':
-                    skipped_count += 1
-                else:
-                    failed_count += 1
-                    last_error = result.get('errorMessage') or result.get('errorCode') or last_error
-                heartbeat_dispatch_job(job, target_count, success_count, failed_count, skipped_count)
+            summary = process_dispatch_targets_concurrently(
+                job,
+                job.snapshot,
+                build_snapshot_dispatch_targets(job.snapshot),
+            )
+        target_count = max(parse_int(summary.get('targetCount'), 0), 0)
+        success_count = max(parse_int(summary.get('successCount'), 0), 0)
+        failed_count = max(parse_int(summary.get('failedCount'), 0), 0)
+        skipped_count = max(parse_int(summary.get('skippedCount'), 0), 0)
+        last_error = summary.get('lastError') or ''
     except Exception as error:
         last_error = str(error)
         return finalize_dispatch_job(
@@ -2072,7 +2378,8 @@ def broadcast_manual_message(payload):
     preview.pop('touser', None)
     campaign_key = resolve_manual_campaign_key(payload.get('campaignKey'))
     snapshot_fingerprint = build_manual_snapshot_fingerprint(campaign_key)
-    target_count = get_dispatchable_subscription_queryset().count()
+    filter_summary = build_manual_dispatch_filter_summary(payload)
+    target_count = get_manual_dispatch_queryset(payload).count()
 
     if payload.get('dryRun'):
         return {
@@ -2080,6 +2387,7 @@ def broadcast_manual_message(payload):
             'campaignKey': campaign_key,
             'snapshotFingerprint': snapshot_fingerprint,
             'targetCount': target_count,
+            'filter': filter_summary,
             'messagePreview': preview,
         }
 
@@ -2091,6 +2399,7 @@ def broadcast_manual_message(payload):
             'campaignKey': campaign_key,
             'snapshotFingerprint': snapshot_fingerprint,
             'targetCount': 0,
+            'filter': filter_summary,
             'messagePreview': preview,
         }
 
@@ -2109,6 +2418,7 @@ def broadcast_manual_message(payload):
         'campaignKey': campaign_key,
         'snapshotFingerprint': snapshot.fingerprint,
         'targetCount': target_count,
+        'filter': filter_summary,
         'messagePreview': preview,
         'job': serialize_dispatch_job(job),
     }
