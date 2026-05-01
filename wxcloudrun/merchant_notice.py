@@ -587,6 +587,84 @@ def fetch_source_payload(force=False, use_cache=True):
     raise MerchantNoticeSourceError('；'.join(errors) if errors else '远行商人数据源全部请求失败')
 
 
+def build_watch_source_candidate(source_name, payload, latest_snapshot=None):
+    payload_summary = summarize_payload(payload)
+    is_same_fingerprint = bool(latest_snapshot and latest_snapshot.fingerprint == payload.get('fingerprint'))
+    is_ready = is_ready_snapshot_payload(payload)
+    if not is_same_fingerprint and is_ready:
+        status = 'ready_changed'
+        rank = 4
+    elif not is_same_fingerprint:
+        status = 'changed_empty'
+        rank = 3
+    elif is_ready:
+        status = 'unchanged'
+        rank = 2
+    else:
+        status = 'unchanged_empty'
+        rank = 1
+
+    attempt_summary = dict(payload_summary)
+    attempt_summary.update({
+        'sourceName': source_name,
+        'status': status,
+        'isReady': is_ready,
+        'isSameFingerprint': is_same_fingerprint,
+    })
+    return {
+        'payload': payload,
+        'payloadSummary': payload_summary,
+        'attemptSummary': attempt_summary,
+        'sourceName': source_name,
+        'status': status,
+        'rank': rank,
+        'isReady': is_ready,
+        'isSameFingerprint': is_same_fingerprint,
+    }
+
+
+def fetch_watch_source_payload(latest_snapshot=None):
+    errors = []
+    source_attempts = []
+    best_candidate = None
+
+    for source_name in get_merchant_source_priority_list():
+        try:
+            payload = fetch_source_payload_from_priority(source_name)
+        except MerchantNoticeSourceError as error:
+            errors.append(f'{source_name}: {error}')
+            source_attempts.append({
+                'sourceName': source_name,
+                'status': 'error',
+                'error': normalize_text(error, 255),
+            })
+            continue
+
+        candidate = build_watch_source_candidate(source_name, payload, latest_snapshot=latest_snapshot)
+        source_attempts.append(candidate['attemptSummary'])
+
+        if best_candidate is None or candidate['rank'] > best_candidate['rank']:
+            best_candidate = candidate
+
+        if candidate['status'] == 'ready_changed':
+            return {
+                'payload': payload,
+                'payloadSummary': candidate['payloadSummary'],
+                'sourceName': source_name,
+                'sourceAttempts': source_attempts,
+            }
+
+    if best_candidate:
+        return {
+            'payload': best_candidate['payload'],
+            'payloadSummary': best_candidate['payloadSummary'],
+            'sourceName': best_candidate['sourceName'],
+            'sourceAttempts': source_attempts,
+        }
+
+    raise MerchantNoticeSourceError('; '.join(errors) if errors else 'merchant source payload fetch failed')
+
+
 def load_items_json(value):
     try:
         parsed = json.loads(value or '[]')
@@ -1972,6 +2050,7 @@ def watch_current_merchant(timeout_seconds=None, poll_interval_seconds=None):
     attempt_count = 0
     latest_snapshot = get_latest_snapshot()
     last_observed_payload = {}
+    last_source_attempts = []
 
     logger.info(
         'merchant watch begin latest_snapshot_id=%s latest_fingerprint=%s timeout_seconds=%s poll_interval_seconds=%s',
@@ -1983,27 +2062,33 @@ def watch_current_merchant(timeout_seconds=None, poll_interval_seconds=None):
 
     while True:
         attempt_count += 1
-        payload = fetch_source_payload(force=True, use_cache=False)
-        payload_summary = summarize_payload(payload)
+        watch_probe = fetch_watch_source_payload(latest_snapshot=latest_snapshot)
+        payload = watch_probe['payload']
+        payload_summary = dict(watch_probe['payloadSummary'])
+        payload_summary['sourceName'] = watch_probe['sourceName']
+        last_source_attempts = watch_probe['sourceAttempts']
         last_observed_payload = payload_summary
         logger.info(
-            'merchant watch attempt=%s payload=%s',
+            'merchant watch attempt=%s payload=%s source_attempts=%s',
             attempt_count,
             json.dumps(payload_summary, ensure_ascii=False, sort_keys=True),
+            json.dumps(last_source_attempts, ensure_ascii=False, sort_keys=True),
         )
         if latest_snapshot and latest_snapshot.fingerprint == payload['fingerprint']:
             if time.monotonic() - started_at >= timeout_seconds:
                 logger.info(
-                    'merchant watch timeout unchanged attempt_count=%s latest_fingerprint=%s last_payload=%s',
+                    'merchant watch timeout unchanged attempt_count=%s latest_fingerprint=%s last_payload=%s source_attempts=%s',
                     attempt_count,
                     latest_snapshot.fingerprint,
                     json.dumps(last_observed_payload, ensure_ascii=False, sort_keys=True),
+                    json.dumps(last_source_attempts, ensure_ascii=False, sort_keys=True),
                 )
                 return {
                     'status': 'timeout',
                     'attemptCount': attempt_count,
                     'latestFingerprint': latest_snapshot.fingerprint,
                     'lastObservedPayload': last_observed_payload,
+                    'sourceAttempts': last_source_attempts,
                 }
             time.sleep(max(poll_interval_seconds, 1))
             continue
@@ -2011,19 +2096,22 @@ def watch_current_merchant(timeout_seconds=None, poll_interval_seconds=None):
         if not is_ready_snapshot_payload(payload):
             if time.monotonic() - started_at >= timeout_seconds:
                 logger.info(
-                    'merchant watch timeout waiting_ready_payload attempt_count=%s last_payload=%s',
+                    'merchant watch timeout waiting_ready_payload attempt_count=%s last_payload=%s source_attempts=%s',
                     attempt_count,
                     json.dumps(last_observed_payload, ensure_ascii=False, sort_keys=True),
+                    json.dumps(last_source_attempts, ensure_ascii=False, sort_keys=True),
                 )
                 return {
                     'status': 'timeout_waiting_ready_payload',
                     'attemptCount': attempt_count,
                     'latestFingerprint': latest_snapshot.fingerprint if latest_snapshot else '',
                     'lastObservedPayload': last_observed_payload,
+                    'sourceAttempts': last_source_attempts,
                 }
             logger.info(
-                'merchant watch waiting for non-empty payload attempt=%s slot_date=%s round=%s fingerprint=%s',
+                'merchant watch waiting for non-empty payload attempt=%s source=%s slot_date=%s round=%s fingerprint=%s',
                 attempt_count,
+                payload_summary.get('sourceName', ''),
                 payload_summary['slotDate'],
                 payload_summary['round'],
                 payload_summary['fingerprint'],
@@ -2044,6 +2132,7 @@ def watch_current_merchant(timeout_seconds=None, poll_interval_seconds=None):
                 'status': 'baseline_created',
                 'attemptCount': attempt_count,
                 'created': created,
+                'sourceAttempts': last_source_attempts,
                 'snapshot': serialize_snapshot(snapshot),
                 'notification': {
                     'status': 'baseline_skipped',
@@ -2057,6 +2146,7 @@ def watch_current_merchant(timeout_seconds=None, poll_interval_seconds=None):
             'status': 'changed',
             'attemptCount': attempt_count,
             'created': created,
+            'sourceAttempts': last_source_attempts,
             'snapshot': serialize_snapshot(snapshot),
             'notification': notification,
         }
