@@ -11,6 +11,12 @@ from django.http import JsonResponse
 from django.shortcuts import render
 from django.utils import timezone
 
+from wxcloudrun.guide_submission import (
+    GuideSubmissionConfigurationError,
+    GuideSubmissionError,
+    parse_submission_payload,
+    upload_submission_archive,
+)
 from wxcloudrun.merchant_notice import (
     MerchantNoticeConfigurationError,
     MerchantNoticePermissionError,
@@ -290,6 +296,38 @@ def egg_feedback(request, _):
     except Exception:
         logger.exception('egg feedback unexpected error')
         rsp = json_response(50001, '提交失败，请稍后重试', status=500)
+
+    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    return rsp
+
+
+def guide_submission(request, _):
+    if request.method != 'POST':
+        rsp = json_response(-1, '请求方法错误', status=405)
+        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        return rsp
+
+    try:
+        body = parse_json_body(request)
+        payload = parse_submission_payload(body)
+        result = upload_submission_archive(
+            payload,
+            {
+                'submitted_at': format_datetime(timezone.now()),
+                'openid': get_header(request, 'X-WX-OPENID'),
+                'appid': get_header(request, 'X-WX-APPID'),
+                'user_agent': request.META.get('HTTP_USER_AGENT', '')[:255],
+                'ip': get_request_ip(request),
+            },
+        )
+        rsp = json_response(0, '', result)
+    except GuideSubmissionConfigurationError as error:
+        rsp = json_response(50321, str(error), status=503)
+    except GuideSubmissionError as error:
+        rsp = json_response(40021, str(error), status=400)
+    except Exception:
+        logger.exception('guide submission unexpected error')
+        rsp = json_response(50021, '攻略提交失败，请稍后再试', status=500)
 
     logger.info('response result: %s', rsp.content.decode('utf-8'))
     return rsp

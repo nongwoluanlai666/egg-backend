@@ -247,6 +247,13 @@ except (TypeError, ValueError):
 
 WECHAT_APP_ID = os.environ.get('WECHAT_APP_ID', os.environ.get('WXA_APPID', '')).strip()
 WECHAT_APP_SECRET = os.environ.get('WECHAT_APP_SECRET', os.environ.get('WXA_APPSECRET', '')).strip()
+OSS_ACCESS_KEY_ID = os.environ.get('OSS_ACCESS_KEY_ID', '').strip()
+OSS_ACCESS_KEY_SECRET = os.environ.get('OSS_ACCESS_KEY_SECRET', '').strip()
+OSS_BUCKET = os.environ.get('OSS_BUCKET', '').strip()
+OSS_REGION = os.environ.get('OSS_REGION', '').strip()
+OSS_UPLOAD_PREFIX = os.environ.get('OSS_UPLOAD_PREFIX', 'uploads/').strip()
+OSS_PUBLIC_BASE_URL = os.environ.get('OSS_PUBLIC_BASE_URL', '').strip()
+GUIDE_SUBMISSION_DRAFT_ROOT = os.environ.get('GUIDE_SUBMISSION_DRAFT_ROOT', '/tmp/guide_submission_drafts').strip()
 
 MERCHANT_NOTICE_TIMEZONE = os.environ.get('MERCHANT_NOTICE_TIMEZONE', 'Asia/Shanghai').strip() or 'Asia/Shanghai'
 MERCHANT_SOURCE_URL = os.environ.get(
