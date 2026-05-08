@@ -7,7 +7,24 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN apt-get update \
+RUN set -eux; \
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i \
+            -e 's|http://deb.debian.org/debian|https://mirrors.tencent.com/debian|g' \
+            -e 's|https://deb.debian.org/debian|https://mirrors.tencent.com/debian|g' \
+            -e 's|http://security.debian.org/debian-security|https://mirrors.tencent.com/debian-security|g' \
+            -e 's|https://security.debian.org/debian-security|https://mirrors.tencent.com/debian-security|g' \
+            /etc/apt/sources.list.d/debian.sources; \
+    fi; \
+    if [ -f /etc/apt/sources.list ]; then \
+        sed -i \
+            -e 's|http://deb.debian.org/debian|https://mirrors.tencent.com/debian|g' \
+            -e 's|https://deb.debian.org/debian|https://mirrors.tencent.com/debian|g' \
+            -e 's|http://security.debian.org/debian-security|https://mirrors.tencent.com/debian-security|g' \
+            -e 's|https://security.debian.org/debian-security|https://mirrors.tencent.com/debian-security|g' \
+            /etc/apt/sources.list; \
+    fi; \
+    apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates cron curl libgomp1 tzdata \
     && ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime \
     && echo "${TZ}" > /etc/timezone \
