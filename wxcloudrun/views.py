@@ -176,7 +176,7 @@ def build_default_predictor_config():
         'id': None,
         'version': runtime.get('version') or 'hybrid-default',
         'strategy': EggPredictorConfig.STRATEGY_HYBRID,
-        'modelType': runtime.get('modelType') or 'sklearn_random_forest_joblib',
+        'modelType': runtime.get('modelType') or 'lightgbm_multiclass_joblib',
         'artifactUri': runtime.get('artifactUri') or runtime.get('artifactPath') or '',
         'notes': '当前线上预测链路为上游优先，失败时回退到云托管本地模型。',
         'isActive': True,
@@ -214,12 +214,35 @@ def egg_predict(request, _):
 
     try:
         payload = parse_predict_payload(request)
-        upstream_data = fetch_upstream_prediction(
-            payload['size'],
-            payload['weight'],
-            payload['rideable_only'],
-        )
-        rsp = json_response(0, '', upstream_data)
+        if settings.EGG_PREDICT_PREFER_LOCAL_FIRST:
+            try:
+                local_data = predict_with_local_model(
+                    payload['size'],
+                    payload['weight'],
+                    payload['rideable_only'],
+                )
+                local_data['fallbackApplied'] = False
+                local_data['preferLocalFirst'] = True
+                rsp = json_response(0, '', local_data)
+            except LocalModelPredictError as local_error:
+                logger.warning('local-first predict failed, fallback to upstream: %s', local_error)
+                upstream_data = fetch_upstream_prediction(
+                    payload['size'],
+                    payload['weight'],
+                    payload['rideable_only'],
+                )
+                upstream_data['fallbackApplied'] = True
+                upstream_data['fallbackReason'] = 'local_model_unavailable'
+                upstream_data['localModelError'] = str(local_error)
+                upstream_data['preferLocalFirst'] = True
+                rsp = json_response(0, '', upstream_data)
+        else:
+            upstream_data = fetch_upstream_prediction(
+                payload['size'],
+                payload['weight'],
+                payload['rideable_only'],
+            )
+            rsp = json_response(0, '', upstream_data)
     except ValidationError as error:
         rsp = json_response(40001, str(error), status=400)
     except UpstreamPredictError as error:

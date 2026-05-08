@@ -244,6 +244,7 @@ try:
     EGG_MODEL_TOP_K = int(os.environ.get('EGG_MODEL_TOP_K', '10'))
 except (TypeError, ValueError):
     EGG_MODEL_TOP_K = 10
+EGG_PREDICT_PREFER_LOCAL_FIRST = parse_env_bool('EGG_PREDICT_PREFER_LOCAL_FIRST', 'false')
 
 WECHAT_APP_ID = os.environ.get('WECHAT_APP_ID', os.environ.get('WXA_APPID', '')).strip()
 WECHAT_APP_SECRET = os.environ.get('WECHAT_APP_SECRET', os.environ.get('WXA_APPSECRET', '')).strip()

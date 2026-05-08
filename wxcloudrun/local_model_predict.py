@@ -4,6 +4,7 @@ import logging
 import os
 import tempfile
 import threading
+import warnings
 from pathlib import Path
 
 import joblib
@@ -16,8 +17,10 @@ from wxcloudrun.models import EggPredictorConfig
 
 
 logger = logging.getLogger('log')
+warnings.filterwarnings('ignore', message='X does not have valid feature names.*')
 
 DEFAULT_MODEL_FILENAME = 'egg_model_v2.joblib.gz'
+DEFAULT_MODEL_TYPE = 'lightgbm_multiclass_joblib'
 DEFAULT_TOP_K = 10
 DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 20
 
@@ -103,7 +106,7 @@ def _build_runtime_config():
     config = {
         'strategy': EggPredictorConfig.STRATEGY_HYBRID,
         'version': '',
-        'model_type': 'sklearn_random_forest_joblib',
+        'model_type': DEFAULT_MODEL_TYPE,
         'artifact_uri': env_artifact_uri,
         'artifact_path': default_path if default_path.exists() else None,
         'config_json': {},
@@ -229,10 +232,25 @@ def _load_model_bundle(force_reload=False):
         if not isinstance(bundle, dict) or 'model' not in bundle or 'classes' not in bundle:
             raise LocalModelPredictError('invalid model bundle format')
 
+        model = bundle['model']
+        if hasattr(model, 'set_params'):
+            try:
+                model.set_params(n_jobs=1)
+            except Exception:  # pragma: no cover - model-specific runtime quirks
+                pass
+        elif hasattr(model, 'n_jobs'):
+            try:
+                model.n_jobs = 1
+            except Exception:  # pragma: no cover - defensive
+                pass
+
         bundle['rideableSpecies'] = set(bundle.get('rideableSpecies', []))
+        runtime_model_type = bundle.get('modelFamily') or runtime_config.get('model_type') or DEFAULT_MODEL_TYPE
+        if bundle.get('modelFamily') == 'lightgbm':
+            runtime_model_type = DEFAULT_MODEL_TYPE
         bundle['_runtime'] = {
             'version': runtime_config.get('version') or bundle.get('version') or 'egg_model_v2',
-            'modelType': runtime_config.get('model_type') or bundle.get('modelFamily') or '',
+            'modelType': runtime_model_type,
             'strategy': runtime_config.get('strategy') or EggPredictorConfig.STRATEGY_HYBRID,
             'artifactKey': artifact_key,
             'artifactPath': str(artifact_path),
@@ -270,7 +288,7 @@ def get_local_model_runtime_summary():
         'available': True,
         'version': runtime.get('version') or bundle.get('version') or 'egg_model_v2',
         'strategy': runtime.get('strategy') or EggPredictorConfig.STRATEGY_HYBRID,
-        'modelType': runtime.get('modelType') or bundle.get('modelFamily') or '',
+        'modelType': runtime.get('modelType') or bundle.get('modelFamily') or DEFAULT_MODEL_TYPE,
         'artifactUri': runtime.get('artifactUri') or '',
         'artifactPath': runtime.get('artifactPath') or '',
         'source': runtime.get('source') or '',
@@ -328,7 +346,7 @@ def predict_with_local_model(size, weight, rideable_only=False, top_k=None):
         'total': len(normalized_results),
         'source': 'cloud_model_fallback',
         'predictionVersion': runtime.get('version') or bundle.get('version') or 'egg_model_v2',
-        'modelType': runtime.get('modelType') or bundle.get('modelFamily') or '',
+        'modelType': runtime.get('modelType') or bundle.get('modelFamily') or DEFAULT_MODEL_TYPE,
         'strategy': runtime.get('strategy') or EggPredictorConfig.STRATEGY_HYBRID,
         'artifactUri': runtime.get('artifactUri') or '',
         'artifactPath': runtime.get('artifactPath') or '',
