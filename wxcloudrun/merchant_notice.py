@@ -31,6 +31,8 @@ DEFAULT_NOTICE_ACTION = '打开蛋查查'
 DEV_SELF_TEST_ITEM_NAMES = ('炫彩蛋', '棱镜球')
 DEV_SELF_TEST_ACTION = '返回蛋查查'
 ROUND_START_HOURS = (8, 12, 16, 20)
+MERCHANT_BACKUP_PRIMARY_ONLY_START_MINUTE = 5
+MERCHANT_BACKUP_PRIMARY_ONLY_END_MINUTE = 8
 MERCHANT_SOURCE_PRIMARY = 'primary'
 MERCHANT_SOURCE_BACKUP = 'backup'
 WECHAT_STABLE_TOKEN_URL = 'https://api.weixin.qq.com/cgi-bin/stable_token'
@@ -430,8 +432,35 @@ def infer_round_number_from_start(start_at, slot_date):
     return len(ROUND_START_HOURS)
 
 
-def select_backup_round_items(normalized_items, slot_date):
-    now = get_local_now()
+def infer_round_number_from_now(slot_date, now=None):
+    current_time = now or get_local_now()
+    for round_number in range(1, len(ROUND_START_HOURS) + 1):
+        round_start_at, round_end_at = build_round_window(slot_date, round_number)
+        if round_start_at <= current_time < round_end_at:
+            return round_number
+    if current_time < build_round_window(slot_date, 1)[0]:
+        return 1
+    return len(ROUND_START_HOURS)
+
+
+def is_same_round_start(value, round_start_at):
+    if not value or not round_start_at:
+        return False
+    return int(abs((value - round_start_at).total_seconds())) <= 60
+
+
+def is_backup_round_specific_item(item, round_start_at, round_end_at):
+    start_at = item.get('startAt')
+    end_at = item.get('endAt')
+    if not is_same_round_start(start_at, round_start_at):
+        return False
+    if not end_at:
+        return False
+    return end_at <= round_end_at + timedelta(seconds=60)
+
+
+def select_backup_round_items(normalized_items, slot_date, now=None):
+    current_time = now or get_local_now()
     all_round_items = [
         item for item in normalized_items
         if not item.get('startAt') and not item.get('endAt')
@@ -443,37 +472,18 @@ def select_backup_round_items(normalized_items, slot_date):
 
     active_timed_items = [
         item for item in timed_items
-        if item['startAt'] <= now and (not item.get('endAt') or now < item['endAt'])
+        if item['startAt'] <= current_time and (not item.get('endAt') or current_time < item['endAt'])
     ]
-    if active_timed_items:
-        selected_start_at = max(item['startAt'] for item in active_timed_items)
-        selected_items = [
-            item for item in active_timed_items
-            if item['startAt'] == selected_start_at
-        ]
-        return selected_start_at, all_round_items + selected_items
-
-    future_timed_items = [
-        item for item in timed_items
-        if item['startAt'] > now
+    expected_round_number = infer_round_number_from_now(slot_date, now=current_time)
+    expected_start_at, expected_end_at = build_round_window(slot_date, expected_round_number)
+    round_specific_items = [
+        item for item in active_timed_items
+        if is_backup_round_specific_item(item, expected_start_at, expected_end_at)
     ]
-    if future_timed_items:
-        selected_start_at = min(item['startAt'] for item in future_timed_items)
-        selected_items = [
-            item for item in future_timed_items
-            if item['startAt'] == selected_start_at
-        ]
-        return selected_start_at, all_round_items + selected_items
+    if round_specific_items:
+        return expected_round_number, expected_start_at, all_round_items + active_timed_items
 
-    if timed_items:
-        selected_start_at = max(item['startAt'] for item in timed_items)
-        selected_items = [
-            item for item in timed_items
-            if item['startAt'] == selected_start_at
-        ]
-        return selected_start_at, all_round_items + selected_items
-
-    return None, all_round_items
+    return None, None, all_round_items
 
 
 def normalize_backup_source_payload(raw_payload):
@@ -490,8 +500,9 @@ def normalize_backup_source_payload(raw_payload):
         for item in (activity.get('get_props') or [])
         if isinstance(item, dict) and normalize_text(item.get('name'), 64)
     ]
-    selected_start_at, selected_items = select_backup_round_items(normalized_items, slot_date)
-    round_number = infer_round_number_from_start(selected_start_at, slot_date)
+    round_number, selected_start_at, selected_items = select_backup_round_items(normalized_items, slot_date)
+    if not selected_start_at:
+        raise MerchantNoticeSourceError('远行商人备用源当前场次数据尚未完整更新')
     total_rounds = len(ROUND_START_HOURS)
     _, next_refresh_at = build_round_window(slot_date, round_number)
     source_updated_at = parse_backup_timestamp_ms(activity.get('created_at')) or get_local_now()
@@ -619,6 +630,25 @@ def fetch_source_payload(force=False, use_cache=True):
     raise MerchantNoticeSourceError('；'.join(errors) if errors else '远行商人数据源全部请求失败')
 
 
+def get_backup_primary_only_window(now=None):
+    current_time = now or get_local_now()
+    for round_hour in ROUND_START_HOURS:
+        round_start_at = datetime.combine(current_time.date(), dt_time(hour=round_hour), tzinfo=get_local_timezone())
+        window_start_at = round_start_at + timedelta(minutes=MERCHANT_BACKUP_PRIMARY_ONLY_START_MINUTE)
+        window_end_at = round_start_at + timedelta(minutes=MERCHANT_BACKUP_PRIMARY_ONLY_END_MINUTE)
+        if window_start_at <= current_time < window_end_at:
+            return {
+                'active': True,
+                'startAt': format_iso_datetime(window_start_at),
+                'endAt': format_iso_datetime(window_end_at),
+            }
+    return {
+        'active': False,
+        'startAt': '',
+        'endAt': '',
+    }
+
+
 def build_watch_source_candidate(source_name, payload, latest_snapshot=None):
     payload_summary = summarize_payload(payload)
     is_same_fingerprint = bool(latest_snapshot and latest_snapshot.fingerprint == payload.get('fingerprint'))
@@ -659,8 +689,18 @@ def fetch_watch_source_payload(latest_snapshot=None):
     errors = []
     source_attempts = []
     best_candidate = None
+    primary_only_window = get_backup_primary_only_window()
 
     for source_name in get_merchant_source_priority_list():
+        if source_name == MERCHANT_SOURCE_BACKUP and primary_only_window['active']:
+            source_attempts.append({
+                'sourceName': source_name,
+                'status': 'skipped_primary_only_window',
+                'windowStartAt': primary_only_window['startAt'],
+                'windowEndAt': primary_only_window['endAt'],
+            })
+            continue
+
         try:
             payload = fetch_source_payload_from_priority(source_name)
         except MerchantNoticeSourceError as error:
@@ -691,6 +731,26 @@ def fetch_watch_source_payload(latest_snapshot=None):
             'payload': best_candidate['payload'],
             'payloadSummary': best_candidate['payloadSummary'],
             'sourceName': best_candidate['sourceName'],
+            'sourceAttempts': source_attempts,
+        }
+
+    if primary_only_window['active'] and latest_snapshot:
+        payload = serialize_snapshot(latest_snapshot)
+        payload_summary = summarize_payload(payload)
+        attempt_summary = dict(payload_summary)
+        attempt_summary.update({
+            'sourceName': 'latest_snapshot',
+            'status': 'unchanged_primary_only_window',
+            'isReady': is_ready_snapshot_payload(payload),
+            'isSameFingerprint': True,
+            'windowStartAt': primary_only_window['startAt'],
+            'windowEndAt': primary_only_window['endAt'],
+        })
+        source_attempts.append(attempt_summary)
+        return {
+            'payload': payload,
+            'payloadSummary': payload_summary,
+            'sourceName': 'latest_snapshot',
             'sourceAttempts': source_attempts,
         }
 
@@ -756,6 +816,21 @@ def get_latest_snapshot(include_manual=False):
     if not include_manual:
         queryset = queryset.exclude(fingerprint__startswith=MANUAL_SNAPSHOT_FINGERPRINT_PREFIX)
     return queryset.first()
+
+
+def snapshot_has_items(snapshot):
+    if not snapshot:
+        return False
+    return len(load_items_json(snapshot.items_json)) > 0
+
+
+def is_same_snapshot_round(snapshot, payload):
+    if not snapshot or not payload:
+        return False
+    return (
+        snapshot.slot_date == parse_slot_date(payload.get('slotDate')) and
+        snapshot.round == parse_int(payload.get('round'), 0)
+    )
 
 
 def build_job_state_defaults(now, guard_seconds):
@@ -2547,6 +2622,33 @@ def watch_current_merchant(timeout_seconds=None, poll_interval_seconds=None):
                 attempt_count,
                 payload_summary.get('sourceName', ''),
                 payload_summary['slotDate'],
+                payload_summary['round'],
+                payload_summary['fingerprint'],
+            )
+            time.sleep(max(poll_interval_seconds, 1))
+            continue
+
+        if latest_snapshot and snapshot_has_items(latest_snapshot) and is_same_snapshot_round(latest_snapshot, payload):
+            if time.monotonic() - started_at >= timeout_seconds:
+                logger.info(
+                    'merchant watch timeout same_round_changed attempt_count=%s latest_round=%s latest_fingerprint=%s last_payload=%s source_attempts=%s',
+                    attempt_count,
+                    latest_snapshot.round,
+                    latest_snapshot.fingerprint,
+                    json.dumps(last_observed_payload, ensure_ascii=False, sort_keys=True),
+                    json.dumps(last_source_attempts, ensure_ascii=False, sort_keys=True),
+                )
+                return {
+                    'status': 'timeout_same_round_changed',
+                    'attemptCount': attempt_count,
+                    'latestFingerprint': latest_snapshot.fingerprint,
+                    'lastObservedPayload': last_observed_payload,
+                    'sourceAttempts': last_source_attempts,
+                }
+            logger.info(
+                'merchant watch waiting for newer round because current round already recorded attempt=%s latest_round=%s payload_round=%s fingerprint=%s',
+                attempt_count,
+                latest_snapshot.round,
                 payload_summary['round'],
                 payload_summary['fingerprint'],
             )
