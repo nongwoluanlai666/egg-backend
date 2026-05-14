@@ -66,4 +66,6 @@ exec gunicorn wxcloudrun.wsgi:application \
   --bind "0.0.0.0:${PORT:-80}" \
   --workers "${GUNICORN_WORKERS:-2}" \
   --threads "${GUNICORN_THREADS:-4}" \
-  --timeout "${GUNICORN_TIMEOUT:-180}"
+  --timeout "${GUNICORN_TIMEOUT:-180}" \
+  --max-requests "${GUNICORN_MAX_REQUESTS:-8000}" \
+  --max-requests-jitter "${GUNICORN_MAX_REQUESTS_JITTER:-1000}"

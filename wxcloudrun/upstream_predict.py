@@ -1,5 +1,7 @@
 import threading
 import time
+import logging
+from collections import OrderedDict
 from copy import deepcopy
 from decimal import Decimal
 
@@ -10,9 +12,12 @@ from django.conf import settings
 DEFAULT_BASE_URL = 'https://roco-eggs.tsuki-world.com'
 DEFAULT_TIMEOUT_SECONDS = 5
 DEFAULT_CACHE_TTL_SECONDS = 300
+DEFAULT_CACHE_MAX_SIZE = 3000
+
+logger = logging.getLogger('log')
 
 _CACHE_LOCK = threading.Lock()
-_PREDICT_CACHE = {}
+_PREDICT_CACHE = OrderedDict()
 
 
 class UpstreamPredictError(Exception):
@@ -39,6 +44,34 @@ def _get_cache_ttl_seconds():
     return max(value, 0)
 
 
+def _get_cache_max_size():
+    try:
+        value = int(getattr(settings, 'ROCO_UPSTREAM_CACHE_MAX_SIZE', DEFAULT_CACHE_MAX_SIZE))
+    except (TypeError, ValueError):
+        value = DEFAULT_CACHE_MAX_SIZE
+    return max(value, 1)
+
+
+def _cleanup_predict_cache_locked(now=None):
+    ttl_seconds = _get_cache_ttl_seconds()
+    if ttl_seconds <= 0:
+        _PREDICT_CACHE.clear()
+        return
+
+    current_time = time.time() if now is None else now
+    expired_keys = [
+        key
+        for key, cached in _PREDICT_CACHE.items()
+        if current_time - cached.get('saved_at', 0) > ttl_seconds
+    ]
+    for key in expired_keys:
+        _PREDICT_CACHE.pop(key, None)
+
+    max_size = _get_cache_max_size()
+    while len(_PREDICT_CACHE) > max_size:
+        _PREDICT_CACHE.popitem(last=False)
+
+
 def _quantize_number(value):
     return str(Decimal(str(value)).quantize(Decimal('0.0001')))
 
@@ -58,12 +91,11 @@ def _get_cached_prediction(cache_key):
 
     now = time.time()
     with _CACHE_LOCK:
+        _cleanup_predict_cache_locked(now)
         cached = _PREDICT_CACHE.get(cache_key)
         if not cached:
             return None
-        if now - cached['saved_at'] > ttl_seconds:
-            _PREDICT_CACHE.pop(cache_key, None)
-            return None
+        _PREDICT_CACHE.move_to_end(cache_key)
         return deepcopy(cached['data'])
 
 
@@ -73,10 +105,13 @@ def _set_cached_prediction(cache_key, data):
         return
 
     with _CACHE_LOCK:
+        _cleanup_predict_cache_locked()
         _PREDICT_CACHE[cache_key] = {
             'saved_at': time.time(),
             'data': deepcopy(data),
         }
+        _PREDICT_CACHE.move_to_end(cache_key)
+        _cleanup_predict_cache_locked()
 
 
 def _build_headers():
@@ -113,10 +148,21 @@ def _normalize_results(results):
 
 
 def fetch_upstream_prediction(size, weight, rideable_only=False, use_cache=True):
+    started_at = time.monotonic()
     cache_key = _build_cache_key(size, weight, rideable_only)
     if use_cache:
         cached = _get_cached_prediction(cache_key)
         if cached is not None:
+            cached_results = cached.get('results') if isinstance(cached.get('results'), list) else []
+            cached_top1 = cached_results[0] if cached_results else {}
+            logger.info(
+                'upstream_predict cache_hit: size=%s weight=%s rideable_only=%s result_count=%s top1=%s',
+                cache_key[0],
+                cache_key[1],
+                cache_key[2],
+                len(cached_results),
+                cached_top1.get('species', ''),
+            )
             return cached
 
     payload = {
@@ -125,6 +171,15 @@ def fetch_upstream_prediction(size, weight, rideable_only=False, use_cache=True)
         'rideable_only': bool(rideable_only),
     }
     request_url = f'{_get_base_url()}/api/predict'
+    logger.info(
+        'upstream_predict request: url=%s size=%s weight=%s rideable_only=%s timeout=%s cache=%s',
+        request_url,
+        cache_key[0],
+        cache_key[1],
+        cache_key[2],
+        _get_timeout_seconds(),
+        bool(use_cache),
+    )
 
     try:
         response = requests.post(
@@ -136,11 +191,36 @@ def fetch_upstream_prediction(size, weight, rideable_only=False, use_cache=True)
         response.raise_for_status()
         data = response.json()
     except requests.RequestException as error:
+        logger.warning(
+            'upstream_predict failed: url=%s size=%s weight=%s rideable_only=%s elapsed_ms=%s error=%s',
+            request_url,
+            cache_key[0],
+            cache_key[1],
+            cache_key[2],
+            int((time.monotonic() - started_at) * 1000),
+            error,
+        )
         raise UpstreamPredictError(f'上游预测接口请求失败: {error}') from error
     except ValueError as error:
+        logger.warning(
+            'upstream_predict invalid_json: url=%s size=%s weight=%s rideable_only=%s elapsed_ms=%s',
+            request_url,
+            cache_key[0],
+            cache_key[1],
+            cache_key[2],
+            int((time.monotonic() - started_at) * 1000),
+        )
         raise UpstreamPredictError('上游预测接口返回了非法 JSON') from error
 
     if not isinstance(data, dict):
+        logger.warning(
+            'upstream_predict invalid_format: url=%s size=%s weight=%s rideable_only=%s elapsed_ms=%s',
+            request_url,
+            cache_key[0],
+            cache_key[1],
+            cache_key[2],
+            int((time.monotonic() - started_at) * 1000),
+        )
         raise UpstreamPredictError('上游预测接口返回格式错误')
 
     normalized = dict(data)
@@ -151,6 +231,19 @@ def fetch_upstream_prediction(size, weight, rideable_only=False, use_cache=True)
 
     if use_cache:
         _set_cached_prediction(cache_key, normalized)
+    normalized_results = normalized.get('results') if isinstance(normalized.get('results'), list) else []
+    top1 = normalized_results[0] if normalized_results else {}
+    logger.info(
+        'upstream_predict success: url=%s size=%s weight=%s rideable_only=%s elapsed_ms=%s result_count=%s top1=%s top1_prob=%s',
+        request_url,
+        cache_key[0],
+        cache_key[1],
+        cache_key[2],
+        int((time.monotonic() - started_at) * 1000),
+        len(normalized_results),
+        top1.get('species', ''),
+        top1.get('prob', None),
+    )
     return normalized
 
 

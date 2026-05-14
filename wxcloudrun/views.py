@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import logging
+import time
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 
@@ -73,6 +74,54 @@ def json_response(code=0, error_msg='', data=None, status=200):
     if data is not None:
         payload['data'] = data
     return JsonResponse(payload, status=status, json_dumps_params={'ensure_ascii': False})
+
+
+def summarize_response_for_log(response):
+    content = getattr(response, 'content', b'') or b''
+    return 'status=%s bytes=%s' % (
+        getattr(response, 'status_code', ''),
+        len(content),
+    )
+
+
+def summarize_prediction_data_for_log(data):
+    raw_results = data.get('results') if isinstance(data, dict) else []
+    results = raw_results if isinstance(raw_results, list) else []
+    top1 = results[0] if results and isinstance(results[0], dict) else {}
+    return {
+        'source': data.get('source', '') if isinstance(data, dict) else '',
+        'predictionVersion': data.get('predictionVersion', '') if isinstance(data, dict) else '',
+        'modelType': data.get('modelType', '') if isinstance(data, dict) else '',
+        'strategy': data.get('strategy', '') if isinstance(data, dict) else '',
+        'fallbackApplied': data.get('fallbackApplied', False) if isinstance(data, dict) else False,
+        'fallbackReason': data.get('fallbackReason', '') if isinstance(data, dict) else '',
+        'preferLocalFirst': data.get('preferLocalFirst', False) if isinstance(data, dict) else False,
+        'fusionApplied': data.get('fusionApplied', False) if isinstance(data, dict) else False,
+        'fusionSpecies': data.get('fusionSpecies', '') if isinstance(data, dict) else '',
+        'total': data.get('total', len(results or [])) if isinstance(data, dict) else 0,
+        'top1Species': top1.get('species', ''),
+        'top1Prob': top1.get('prob', None),
+    }
+
+
+def log_predict_route(route, payload, data=None, started_at=None, error=None):
+    log_data = {
+        'route': route,
+        'preferLocalFirst': bool(getattr(settings, 'EGG_PREDICT_PREFER_LOCAL_FIRST', False)),
+    }
+    if payload:
+        log_data.update({
+            'size': str(payload.get('size', '')),
+            'weight': str(payload.get('weight', '')),
+            'rideableOnly': bool(payload.get('rideable_only', False)),
+        })
+    if data:
+        log_data.update(summarize_prediction_data_for_log(data))
+    if started_at is not None:
+        log_data['elapsedMs'] = int((time.monotonic() - started_at) * 1000)
+    if error:
+        log_data['error'] = str(error)[:500]
+    logger.info('egg_predict route: %s', json.dumps(log_data, ensure_ascii=False, sort_keys=True))
 
 
 def index(request, _):
@@ -202,18 +251,29 @@ def counter(request, _):
             rsp = json_response(-1, '请求方式错误', status=405)
     except ValidationError as error:
         rsp = json_response(40001, str(error), status=400)
-    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    logger.info('response result: %s', summarize_response_for_log(rsp))
     return rsp
 
 
 def egg_predict(request, _):
     if request.method != 'POST':
         rsp = json_response(-1, '请求方式错误', status=405)
-        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        logger.info('response result: %s', summarize_response_for_log(rsp))
         return rsp
 
+    started_at = time.monotonic()
+    payload = None
     try:
         payload = parse_predict_payload(request)
+        logger.info(
+            'egg_predict request: %s',
+            json.dumps({
+                'size': str(payload['size']),
+                'weight': str(payload['weight']),
+                'rideableOnly': bool(payload['rideable_only']),
+                'preferLocalFirst': bool(settings.EGG_PREDICT_PREFER_LOCAL_FIRST),
+            }, ensure_ascii=False, sort_keys=True),
+        )
         if settings.EGG_PREDICT_PREFER_LOCAL_FIRST:
             try:
                 local_data = predict_with_local_model(
@@ -223,6 +283,7 @@ def egg_predict(request, _):
                 )
                 local_data['fallbackApplied'] = False
                 local_data['preferLocalFirst'] = True
+                log_predict_route('local_first.local_model_success', payload, local_data, started_at)
                 rsp = json_response(0, '', local_data)
             except LocalModelPredictError as local_error:
                 logger.warning('local-first predict failed, fallback to upstream: %s', local_error)
@@ -235,6 +296,13 @@ def egg_predict(request, _):
                 upstream_data['fallbackReason'] = 'local_model_unavailable'
                 upstream_data['localModelError'] = str(local_error)
                 upstream_data['preferLocalFirst'] = True
+                log_predict_route(
+                    'local_first.upstream_fallback_success',
+                    payload,
+                    upstream_data,
+                    started_at,
+                    error=local_error,
+                )
                 rsp = json_response(0, '', upstream_data)
         else:
             upstream_data = fetch_upstream_prediction(
@@ -242,8 +310,10 @@ def egg_predict(request, _):
                 payload['weight'],
                 payload['rideable_only'],
             )
+            log_predict_route('upstream_first.upstream_success', payload, upstream_data, started_at)
             rsp = json_response(0, '', upstream_data)
     except ValidationError as error:
+        log_predict_route('validation_error', payload, started_at=started_at, error=error)
         rsp = json_response(40001, str(error), status=400)
     except UpstreamPredictError as error:
         logger.warning('upstream predict failed: %s', error)
@@ -256,22 +326,36 @@ def egg_predict(request, _):
             fallback_data['fallbackApplied'] = True
             fallback_data['fallbackReason'] = 'upstream_unavailable'
             fallback_data['upstreamError'] = str(error)
+            log_predict_route(
+                'upstream_first.local_model_fallback_success',
+                payload,
+                fallback_data,
+                started_at,
+                error=error,
+            )
             rsp = json_response(0, '', fallback_data)
         except LocalModelPredictError as model_error:
             logger.warning('local model fallback failed: %s', model_error)
+            log_predict_route(
+                'upstream_first.all_failed',
+                payload,
+                started_at=started_at,
+                error=f'{error}; local model fallback failed: {model_error}',
+            )
             rsp = json_response(50201, f'{error}; local model fallback failed: {model_error}', status=502)
     except Exception:
         logger.exception('egg predict unexpected error')
+        log_predict_route('unexpected_error', payload, started_at=started_at)
         rsp = json_response(50002, '预测服务暂时不可用，请稍后再试', status=500)
 
-    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    logger.info('response result: %s', summarize_response_for_log(rsp))
     return rsp
 
 
 def egg_feedback(request, _):
     if request.method != 'POST':
         rsp = json_response(-1, '请求方式错误', status=405)
-        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        logger.info('response result: %s', summarize_response_for_log(rsp))
         return rsp
 
     try:
@@ -279,13 +363,13 @@ def egg_feedback(request, _):
         existing = find_existing_feedback(payload)
         if existing:
             rsp = json_response(0, '', build_feedback_response_data(existing, duplicated=True))
-            logger.info('response result: %s', rsp.content.decode('utf-8'))
+            logger.info('response result: %s', summarize_response_for_log(rsp))
             return rsp
 
         rate_limit_error = get_rate_limit_error(payload)
         if rate_limit_error:
             rsp = json_response(42901, rate_limit_error, status=429)
-            logger.info('response result: %s', rsp.content.decode('utf-8'))
+            logger.info('response result: %s', summarize_response_for_log(rsp))
             return rsp
 
         quality_status, quality_score, review_note = build_quality_result(payload)
@@ -320,14 +404,14 @@ def egg_feedback(request, _):
         logger.exception('egg feedback unexpected error')
         rsp = json_response(50001, '提交失败，请稍后重试', status=500)
 
-    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    logger.info('response result: %s', summarize_response_for_log(rsp))
     return rsp
 
 
 def guide_submission(request, _):
     if request.method != 'POST':
         rsp = json_response(-1, '请求方法错误', status=405)
-        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        logger.info('response result: %s', summarize_response_for_log(rsp))
         return rsp
 
     try:
@@ -352,14 +436,14 @@ def guide_submission(request, _):
         logger.exception('guide submission unexpected error')
         rsp = json_response(50021, '攻略提交失败，请稍后再试', status=500)
 
-    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    logger.info('response result: %s', summarize_response_for_log(rsp))
     return rsp
 
 
 def dev_feedback_export(request, _):
     if request.method not in {'GET', 'POST'}:
         rsp = json_response(-1, '请求方式错误', status=405)
-        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        logger.info('response result: %s', summarize_response_for_log(rsp))
         return rsp
 
     try:
@@ -410,14 +494,14 @@ def dev_feedback_export(request, _):
         logger.exception('dev feedback export unexpected error')
         rsp = json_response(50003, '导出失败，请稍后重试', status=500)
 
-    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    logger.info('response result: %s', summarize_response_for_log(rsp))
     return rsp
 
 
 def dev_model_config(request, _):
     if request.method not in {'GET', 'POST'}:
         rsp = json_response(-1, '请求方式错误', status=405)
-        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        logger.info('response result: %s', summarize_response_for_log(rsp))
         return rsp
 
     try:
@@ -491,14 +575,14 @@ def dev_model_config(request, _):
         logger.exception('dev model config unexpected error')
         rsp = json_response(50004, '配置保存失败，请稍后重试', status=500)
 
-    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    logger.info('response result: %s', summarize_response_for_log(rsp))
     return rsp
 
 
 def merchant_notice_current(request, _):
     if request.method != 'GET':
         rsp = json_response(-1, '请求方式错误', status=405)
-        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        logger.info('response result: %s', summarize_response_for_log(rsp))
         return rsp
 
     try:
@@ -512,14 +596,14 @@ def merchant_notice_current(request, _):
         logger.exception('merchant notice current unexpected error')
         rsp = json_response(50011, '远行提醒数据暂时不可用，请稍后再试', status=500)
 
-    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    logger.info('response result: %s', summarize_response_for_log(rsp))
     return rsp
 
 
 def merchant_notice_subscribe_next(request, _):
     if request.method != 'POST':
         rsp = json_response(-1, '请求方式错误', status=405)
-        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        logger.info('response result: %s', summarize_response_for_log(rsp))
         return rsp
 
     try:
@@ -539,14 +623,14 @@ def merchant_notice_subscribe_next(request, _):
         logger.exception('merchant notice subscribe unexpected error')
         rsp = json_response(50012, '开启远行提醒失败，请稍后再试', status=500)
 
-    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    logger.info('response result: %s', summarize_response_for_log(rsp))
     return rsp
 
 
 def merchant_notice_subscribe_status(request, _):
     if request.method != 'GET':
         rsp = json_response(-1, '请求方式错误', status=405)
-        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        logger.info('response result: %s', summarize_response_for_log(rsp))
         return rsp
 
     try:
@@ -565,14 +649,14 @@ def merchant_notice_subscribe_status(request, _):
         logger.exception('merchant notice subscribe status unexpected error')
         rsp = json_response(50016, '远行提醒状态检查失败，请稍后再试', status=500)
 
-    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    logger.info('response result: %s', summarize_response_for_log(rsp))
     return rsp
 
 
 def merchant_notice_reward_unlock(request, _):
     if request.method != 'POST':
         rsp = json_response(-1, '请求方式错误', status=405)
-        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        logger.info('response result: %s', summarize_response_for_log(rsp))
         return rsp
 
     try:
@@ -596,14 +680,14 @@ def merchant_notice_reward_unlock(request, _):
         logger.exception('merchant notice reward unlock unexpected error')
         rsp = json_response(50017, '激励校验失败，请稍后再试', status=500)
 
-    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    logger.info('response result: %s', summarize_response_for_log(rsp))
     return rsp
 
 
 def merchant_notice_dev_self_test(request, _):
     if request.method != 'POST':
         rsp = json_response(-1, '请求方式错误', status=405)
-        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        logger.info('response result: %s', summarize_response_for_log(rsp))
         return rsp
 
     try:
@@ -633,14 +717,14 @@ def merchant_notice_dev_self_test(request, _):
         logger.exception('merchant notice dev self test unexpected error')
         rsp = json_response(50018, '开发模式测试通知发送失败，请稍后再试', status=500)
 
-    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    logger.info('response result: %s', summarize_response_for_log(rsp))
     return rsp
 
 
 def merchant_notice_preferences(request, _):
     if request.method not in {'GET', 'POST'}:
         rsp = json_response(-1, '请求方式错误', status=405)
-        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        logger.info('response result: %s', summarize_response_for_log(rsp))
         return rsp
 
     try:
@@ -671,14 +755,14 @@ def merchant_notice_preferences(request, _):
         logger.exception('merchant notice preferences unexpected error')
         rsp = json_response(50015, '通知商品配置保存失败，请稍后再试', status=500)
 
-    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    logger.info('response result: %s', summarize_response_for_log(rsp))
     return rsp
 
 
 def internal_merchant_watch(request, _):
     if request.method not in {'GET', 'POST'}:
         rsp = json_response(-1, '请求方式错误', status=405)
-        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        logger.info('response result: %s', summarize_response_for_log(rsp))
         return rsp
 
     try:
@@ -721,14 +805,14 @@ def internal_merchant_watch(request, _):
         logger.exception('internal merchant watch unexpected error')
         rsp = json_response(50013, '远行提醒任务执行失败', status=500)
 
-    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    logger.info('response result: %s', summarize_response_for_log(rsp))
     return rsp
 
 
 def dev_merchant_notice_broadcast(request, _):
     if request.method != 'POST':
         rsp = json_response(-1, '请求方式错误', status=405)
-        logger.info('response result: %s', rsp.content.decode('utf-8'))
+        logger.info('response result: %s', summarize_response_for_log(rsp))
         return rsp
 
     try:
@@ -750,7 +834,7 @@ def dev_merchant_notice_broadcast(request, _):
         logger.exception('dev merchant notice broadcast unexpected error')
         rsp = json_response(50014, '手动远行提醒发送失败，请稍后再试', status=500)
 
-    logger.info('response result: %s', rsp.content.decode('utf-8'))
+    logger.info('response result: %s', summarize_response_for_log(rsp))
     return rsp
 
 

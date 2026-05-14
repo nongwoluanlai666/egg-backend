@@ -199,6 +199,115 @@ def _build_feature_vector(size, weight):
     ]], dtype=np.float32)
 
 
+def _build_knn_feature_vector(size, weight, transform):
+    mode = str((transform or {}).get('mode') or '').strip()
+    size_value = float(size)
+    weight_value = float(weight)
+    log_weight_value = np.log1p(max(weight_value, 0.0))
+    safe_size = max(size_value, 0.02)
+
+    if mode == 'standard_size_log_weight':
+        raw = np.asarray([[size_value, log_weight_value]], dtype=np.float32)
+    elif mode == 'standard_size_weight_ratio':
+        raw = np.asarray([[size_value, weight_value, weight_value / safe_size]], dtype=np.float32)
+    elif mode == 'bucket_size_log_weight':
+        raw = np.asarray([[size_value / 0.01, log_weight_value / 0.08]], dtype=np.float32)
+    elif mode == 'bucket_size_weight':
+        raw = np.asarray([[size_value / 0.01, weight_value / 1.0]], dtype=np.float32)
+    else:
+        raise LocalModelPredictError(f'unsupported fusion feature mode: {mode}')
+
+    if transform.get('mean') is not None:
+        mean = np.asarray(transform.get('mean'), dtype=np.float32)
+        std = np.asarray(transform.get('std'), dtype=np.float32)
+        std[std < 1e-6] = 1.0
+        raw = (raw - mean) / std
+    return raw.astype(np.float32)
+
+
+def _make_scoped_rank(probabilities, classes, rideable_species, rideable_only, limit):
+    scoped = probabilities
+    if rideable_only:
+        scoped = np.asarray(probabilities, dtype=np.float64).copy()
+        rideable_mask = np.asarray([species in rideable_species for species in classes], dtype=bool)
+        scoped[~rideable_mask] = -1.0
+    return np.argsort(scoped)[::-1][:limit]
+
+
+def _compute_fusion_vote(bundle, size, weight, rideable_only):
+    fusion = bundle.get('fusion') or {}
+    if not fusion.get('enabled'):
+        return None
+
+    params = fusion.get('params') or {}
+    neighbors = fusion.get('neighbors')
+    if neighbors is None:
+        return None
+
+    transform = fusion.get('transform') or {}
+    query_x = _build_knn_feature_vector(size, weight, transform)
+    train_species_indices = np.asarray(fusion.get('trainSpeciesIndices'), dtype=np.int32)
+    train_weights = np.asarray(fusion.get('trainWeights'), dtype=np.float32)
+    train_rideable = np.asarray(fusion.get('trainRideable'), dtype=bool)
+    if train_species_indices.size == 0 or train_weights.size == 0:
+        return None
+
+    try:
+        requested_neighbors = int(params.get('neighbors') or 20)
+    except (TypeError, ValueError):
+        requested_neighbors = 20
+    requested_neighbors = max(1, min(requested_neighbors, train_species_indices.size))
+    distances, indices = neighbors.kneighbors(query_x, n_neighbors=requested_neighbors, return_distance=True)
+    neighbor_indices = indices[0].astype(np.int32)
+    neighbor_distances = distances[0].astype(np.float32)
+
+    if rideable_only:
+        keep_mask = train_rideable[neighbor_indices]
+        neighbor_indices = neighbor_indices[keep_mask]
+        neighbor_distances = neighbor_distances[keep_mask]
+        if len(neighbor_indices) == 0:
+            return None
+
+    species_indices = train_species_indices[neighbor_indices]
+    base_weights = train_weights[neighbor_indices]
+    try:
+        bandwidth = max(float(params.get('bandwidth') or 0.2), 1e-6)
+    except (TypeError, ValueError):
+        bandwidth = 0.2
+    distance_weights = np.exp(-0.5 * np.square(neighbor_distances / bandwidth))
+    scores = np.bincount(
+        species_indices,
+        weights=base_weights * distance_weights,
+        minlength=len(bundle.get('classes') or []),
+    )
+    total = float(scores.sum())
+    if total <= 0:
+        return None
+
+    ranked_indices = np.argsort(scores)[::-1]
+    top_index = int(ranked_indices[0])
+    top_score = float(scores[top_index])
+    second_score = float(scores[ranked_indices[1]]) if len(ranked_indices) > 1 else 0.0
+    vote = {
+        'speciesIndex': top_index,
+        'confidence': top_score / total,
+        'margin': top_score / max(second_score, 1e-9),
+        'nearestDistance': float(neighbor_distances[0]) if len(neighbor_distances) else None,
+        'params': params,
+    }
+
+    try:
+        accepted = (
+            vote['confidence'] >= float(params.get('confidence') or 0.5) and
+            vote['margin'] >= float(params.get('margin') or 1.2) and
+            vote['nearestDistance'] <= float(params.get('maxDistance') or 0.75)
+        )
+    except (TypeError, ValueError):
+        accepted = False
+    vote['accepted'] = accepted
+    return vote
+
+
 def _load_model_bundle(force_reload=False):
     with _MODEL_LOCK:
         if not force_reload and _MODEL_STATE['loaded'] and _MODEL_STATE['bundle'] is not None:
@@ -293,6 +402,7 @@ def get_local_model_runtime_summary():
         'artifactPath': runtime.get('artifactPath') or '',
         'source': runtime.get('source') or '',
         'classCount': len(bundle.get('classes') or []),
+        'fusionEnabled': bool(bundle.get('fusion') and bundle.get('fusion', {}).get('enabled')),
     }
 
 
@@ -320,19 +430,35 @@ def predict_with_local_model(size, weight, rideable_only=False, top_k=None):
     features = _build_feature_vector(size, weight)
     probabilities = bundle['model'].predict_proba(features)[0]
     classes = bundle['classes']
-    candidates = list(zip(classes, probabilities))
+    fusion_vote = _compute_fusion_vote(bundle, size, weight, rideable_only)
+    use_fusion = bool(fusion_vote and fusion_vote.get('accepted'))
+    ranked_indices = _make_scoped_rank(
+        probabilities,
+        classes,
+        bundle['rideableSpecies'],
+        rideable_only,
+        top_k or _get_default_top_k(),
+    )
+    if (
+        use_fusion and
+        fusion_vote.get('params', {}).get('requireBaseTop10', True) and
+        int(fusion_vote['speciesIndex']) not in {int(index) for index in ranked_indices}
+    ):
+        use_fusion = False
+    if use_fusion:
+        fusion_index = int(fusion_vote['speciesIndex'])
+        ranked_indices = np.asarray(
+            [fusion_index] + [int(index) for index in ranked_indices if int(index) != fusion_index],
+            dtype=np.int32,
+        )[:max(1, top_k or _get_default_top_k())]
 
-    if rideable_only:
-        candidates = [
-            (species, prob)
-            for species, prob in candidates
-            if species in bundle['rideableSpecies']
-        ]
-
-    candidates.sort(key=lambda item: item[1], reverse=True)
     result_limit = top_k or _get_default_top_k()
     normalized_results = []
-    for index, (species, prob) in enumerate(candidates[:result_limit], start=1):
+    for index, species_index in enumerate(ranked_indices[:result_limit], start=1):
+        species = classes[int(species_index)]
+        prob = float(probabilities[int(species_index)])
+        if use_fusion and int(species_index) == int(fusion_vote['speciesIndex']):
+            prob = max(prob, float(fusion_vote['confidence']))
         normalized_results.append({
             'species': species,
             'prob': float(prob),
@@ -350,4 +476,9 @@ def predict_with_local_model(size, weight, rideable_only=False, top_k=None):
         'strategy': runtime.get('strategy') or EggPredictorConfig.STRATEGY_HYBRID,
         'artifactUri': runtime.get('artifactUri') or '',
         'artifactPath': runtime.get('artifactPath') or '',
+        'fusionApplied': use_fusion,
+        'fusionSpecies': classes[int(fusion_vote['speciesIndex'])] if use_fusion else '',
+        'fusionConfidence': float(fusion_vote['confidence']) if use_fusion else None,
+        'fusionMargin': float(fusion_vote['margin']) if use_fusion else None,
+        'fusionNearestDistance': float(fusion_vote['nearestDistance']) if use_fusion else None,
     }
