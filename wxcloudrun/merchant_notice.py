@@ -56,6 +56,7 @@ _ACCESS_TOKEN_CACHE = {
     'expires_at': 0.0,
 }
 _ACCESS_TOKEN_CACHE_LOCK = threading.Lock()
+_WECHAT_SESSION_LOCAL = threading.local()
 GOODS_NAME_ALIASES = {
     '炫彩蛋': '炫彩精灵蛋',
 }
@@ -1491,6 +1492,24 @@ def get_wechat_send_retry_delay_seconds():
     return max(float(getattr(settings, 'MERCHANT_NOTIFY_SEND_RETRY_DELAY_SECONDS', 1.5) or 1.5), 0.1)
 
 
+def get_wechat_subscribe_send_session():
+    session = getattr(_WECHAT_SESSION_LOCAL, 'subscribe_send_session', None)
+    if session is None:
+        session = requests.Session()
+        _WECHAT_SESSION_LOCAL.subscribe_send_session = session
+    return session
+
+
+def close_wechat_subscribe_send_session():
+    session = getattr(_WECHAT_SESSION_LOCAL, 'subscribe_send_session', None)
+    if session is None:
+        return
+    try:
+        session.close()
+    finally:
+        _WECHAT_SESSION_LOCAL.subscribe_send_session = None
+
+
 def post_wechat_subscribe_message(request_payload):
     access_token = build_wechat_access_token()
     retry_count = get_wechat_send_retry_count()
@@ -1499,7 +1518,7 @@ def post_wechat_subscribe_message(request_payload):
 
     for attempt in range(retry_count + 1):
         try:
-            response = requests.post(
+            response = get_wechat_subscribe_send_session().post(
                 WECHAT_SUBSCRIBE_SEND_URL,
                 params={'access_token': access_token},
                 json=request_payload,
@@ -1511,6 +1530,7 @@ def post_wechat_subscribe_message(request_payload):
             except ValueError as error:
                 raise MerchantNoticeSourceError('微信订阅消息发送接口返回了非 JSON 数据') from error
         except requests.RequestException as error:
+            close_wechat_subscribe_send_session()
             last_error = error
             if attempt >= retry_count:
                 break
@@ -1999,7 +2019,7 @@ def get_dispatch_worker_stale_seconds():
 
 
 def get_dispatch_worker_concurrency():
-    return max(parse_int(getattr(settings, 'MERCHANT_NOTICE_DISPATCH_CONCURRENCY', 10), 10), 1)
+    return max(parse_int(getattr(settings, 'MERCHANT_NOTICE_DISPATCH_CONCURRENCY', 20), 20), 1)
 
 
 def get_dispatch_worker_heartbeat_seconds():
@@ -2308,6 +2328,7 @@ def process_dispatch_target_slice(job, snapshot, targets, progress_tracker):
                     getattr(snapshot, 'id', 0),
                 )
     finally:
+        close_wechat_subscribe_send_session()
         close_old_connections()
 
     return {
