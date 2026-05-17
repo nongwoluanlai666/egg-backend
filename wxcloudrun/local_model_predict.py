@@ -445,6 +445,13 @@ def predict_with_local_model(size, weight, rideable_only=False, top_k=None):
         int(fusion_vote['speciesIndex']) not in {int(index) for index in ranked_indices}
     ):
         use_fusion = False
+    if (
+        use_fusion and
+        fusion_vote.get('params', {}).get('requireConfidenceAboveBaseTop1', True)
+    ):
+        base_top1_probability = float(probabilities[int(ranked_indices[0])])
+        if float(fusion_vote['confidence']) <= base_top1_probability:
+            use_fusion = False
     if use_fusion:
         fusion_index = int(fusion_vote['speciesIndex'])
         ranked_indices = np.asarray(
