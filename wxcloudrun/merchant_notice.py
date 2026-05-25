@@ -25,8 +25,10 @@ from wxcloudrun.models import (
 
 logger = logging.getLogger('log')
 
-DEFAULT_SPECIAL_KEYWORDS = ('炫彩', '棱镜球', '同乘', '祝福项坠')
-DEFAULT_SELECTED_GOODS = ('炫彩蛋', '棱镜球', '祝福项坠', '黑白炫彩蛋', '赛季炫彩蛋')
+DEFAULT_SPECIAL_KEYWORDS = ('炫彩', '棱镜球', '同乘', '祝福项坠', '残缺魔镜', '适格钥匙', '能力钥匙')
+DEFAULT_SELECTED_GOODS = ('炫彩蛋', '棱镜球', '祝福项坠', '黑白炫彩蛋', '赛季炫彩蛋', '残缺魔镜', '适格钥匙', '能力钥匙')
+REQUIRED_SPECIAL_KEYWORDS = ('残缺魔镜', '适格钥匙', '能力钥匙')
+REQUIRED_DEFAULT_SELECTED_GOODS = ('残缺魔镜', '适格钥匙', '能力钥匙')
 DEFAULT_NOTICE_ACTION = '打开蛋查查'
 DEV_SELF_TEST_ITEM_NAMES = ('炫彩蛋', '棱镜球')
 DEV_SELF_TEST_ACTION = '返回蛋查查'
@@ -140,6 +142,18 @@ def parse_int(value, default=0):
         return default
 
 
+def append_missing_text(items, additions, max_length=64):
+    results = []
+    seen = set()
+    for item in list(items or []) + list(additions or []):
+        normalized = normalize_text(item, max_length)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        results.append(normalized)
+    return results
+
+
 def get_trigger_guard_seconds():
     return max(parse_int(getattr(settings, 'MERCHANT_NOTIFY_TRIGGER_GUARD_SECONDS', 1800), 1800), 0)
 
@@ -158,7 +172,7 @@ def get_special_keywords():
         cleaned = normalize_text(item, 32)
         if cleaned and cleaned not in keywords:
             keywords.append(cleaned)
-    return keywords or list(DEFAULT_SPECIAL_KEYWORDS)
+    return append_missing_text(keywords or list(DEFAULT_SPECIAL_KEYWORDS), REQUIRED_SPECIAL_KEYWORDS, 32)
 
 
 def normalize_goods_name(value):
@@ -204,7 +218,30 @@ def get_default_selected_goods():
     if not raw:
         return list(DEFAULT_SELECTED_GOODS)
 
-    return dedupe_goods_names(raw.replace('，', ',').split(',')) or list(DEFAULT_SELECTED_GOODS)
+    configured = dedupe_goods_names(raw.replace('，', ',').split(',')) or list(DEFAULT_SELECTED_GOODS)
+    return dedupe_goods_names(configured + list(REQUIRED_DEFAULT_SELECTED_GOODS))
+
+
+def sort_goods_by_notice_priority(items):
+    normalized = dedupe_goods_names(items)
+    if len(normalized) <= 1:
+        return normalized
+
+    priority_index = {
+        name: index
+        for index, name in enumerate(get_default_selected_goods())
+    }
+    fallback_offset = len(priority_index)
+
+    return [
+        item for _index, item in sorted(
+            enumerate(normalized),
+            key=lambda pair: (
+                priority_index.get(pair[1], fallback_offset + pair[0]),
+                pair[0],
+            ),
+        )
+    ]
 
 
 def serialize_goods_names(items):
@@ -780,10 +817,10 @@ def serialize_snapshot(snapshot):
         'nextRefreshLabel': format_next_refresh_label(next_refresh_at),
         'items': items,
         'hasSpecialHit': bool(snapshot.has_special_hit),
-        'specialItemNames': [
+        'specialItemNames': sort_goods_by_notice_priority([
             name for name in str(snapshot.special_item_names or '').split('、')
             if name
-        ],
+        ]),
         'fingerprint': snapshot.fingerprint,
     }
 
@@ -802,7 +839,7 @@ def summarize_payload(payload):
         'itemCount': len(item_names),
         'itemNames': item_names[:5],
         'hasSpecialHit': bool(payload.get('hasSpecialHit')),
-        'specialItemNames': dedupe_goods_names(payload.get('specialItemNames') or []),
+        'specialItemNames': sort_goods_by_notice_priority(payload.get('specialItemNames') or []),
         'sourceUpdatedAt': normalize_text(payload.get('sourceUpdatedAt'), 32),
         'fingerprint': normalize_text(payload.get('fingerprint'), 64),
     }
@@ -1036,7 +1073,7 @@ def get_effective_selected_goods(record):
 
 
 def build_subscription_preferences(record):
-    selected_goods = export_goods_names(get_effective_selected_goods(record))
+    selected_goods = export_goods_names(sort_goods_by_notice_priority(get_effective_selected_goods(record)))
     default_selected_goods = export_goods_names(get_default_selected_goods())
     return {
         'selectedGoods': selected_goods,
@@ -1166,7 +1203,9 @@ def sanitize_current_payload_for_client(payload):
         sanitized_items.append(sanitized_item)
 
     sanitized_payload['items'] = sanitized_items
-    sanitized_payload['specialItemNames'] = export_goods_names(sanitized_payload.get('specialItemNames') or [])
+    sanitized_payload['specialItemNames'] = export_goods_names(
+        sort_goods_by_notice_priority(sanitized_payload.get('specialItemNames') or [])
+    )
     return sanitized_payload
 
 
@@ -1557,13 +1596,13 @@ def build_notice_advice_text(action_text, remaining_count):
     remaining = max(parse_int(remaining_count, 0), 0)
     if remaining > 0:
         return truncate_text(f'{action}，剩{remaining}次提醒', 20)
-    return truncate_text(f'{action}，可再订阅', 20)
+    return truncate_text('订阅次数耗尽，需重新订阅！！', 20)
 
 
 def build_special_item_summary(names):
     normalized_names = [
         normalize_text(name, 20)
-        for name in export_goods_names(names)
+        for name in export_goods_names(sort_goods_by_notice_priority(names))
         if normalize_text(name, 20)
     ]
     if not normalized_names:
@@ -1584,9 +1623,9 @@ def normalize_message_item_names(snapshot, item_names=None):
         else:
             normalized = dedupe_goods_names(item_names)
         if normalized:
-            return normalized
+            return sort_goods_by_notice_priority(normalized)
 
-    return dedupe_goods_names(str(snapshot.special_item_names or '').split('、'))
+    return sort_goods_by_notice_priority(str(snapshot.special_item_names or '').split('、'))
 
 
 def get_snapshot_item_names(snapshot):
@@ -1601,11 +1640,11 @@ def get_matching_selected_goods(subscription, snapshot):
     selected_goods = set(get_effective_selected_goods(subscription))
     if not selected_goods:
         return []
-    return [
+    return sort_goods_by_notice_priority([
         item_name
         for item_name in get_snapshot_item_names(snapshot)
         if item_name in selected_goods
-    ]
+    ])
 
 
 def get_dispatchable_subscription_queryset():
@@ -1917,7 +1956,7 @@ def create_snapshot_from_payload(payload):
             'source_updated_at': payload.get('sourceUpdatedAt', ''),
             'items_json': json.dumps(payload['items'], ensure_ascii=False),
             'has_special_hit': payload['hasSpecialHit'],
-            'special_item_names': '、'.join(payload['specialItemNames']),
+            'special_item_names': '、'.join(sort_goods_by_notice_priority(payload['specialItemNames'])),
             'created_at': now,
         },
     )

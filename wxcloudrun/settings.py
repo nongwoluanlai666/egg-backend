@@ -299,11 +299,11 @@ MERCHANT_NOTIFY_PAGE = os.environ.get(
 ).strip()
 MERCHANT_NOTIFY_SPECIAL_KEYWORDS = os.environ.get(
     'MERCHANT_NOTIFY_SPECIAL_KEYWORDS',
-    '炫彩,棱镜球,同乘,祝福项坠',
+    '炫彩,棱镜球,同乘,祝福项坠,残缺魔镜,适格钥匙,能力钥匙',
 ).strip()
 MERCHANT_NOTIFY_DEFAULT_SELECTED_GOODS = os.environ.get(
     'MERCHANT_NOTIFY_DEFAULT_SELECTED_GOODS',
-    '炫彩蛋,棱镜球,祝福项坠,黑白炫彩蛋,赛季炫彩蛋',
+    '炫彩蛋,棱镜球,祝福项坠,黑白炫彩蛋,赛季炫彩蛋,残缺魔镜,适格钥匙,能力钥匙',
 ).strip()
 MERCHANT_NOTIFY_JOB_TOKEN = os.environ.get('MERCHANT_NOTIFY_JOB_TOKEN', '').strip()
 MERCHANT_NOTIFY_MINIPROGRAM_STATE = os.environ.get('MERCHANT_NOTIFY_MINIPROGRAM_STATE', '').strip()
