@@ -275,7 +275,11 @@ MERCHANT_SOURCE_USER_AGENT = os.environ.get(
 ).strip()
 MERCHANT_SOURCE_PRIORITY = os.environ.get(
     'MERCHANT_SOURCE_PRIORITY',
-    'primary,backup',
+    'backup,primary',
+).strip()
+MERCHANT_WATCH_SOURCE_PRIORITY = os.environ.get(
+    'MERCHANT_WATCH_SOURCE_PRIORITY',
+    'backup,primary',
 ).strip()
 MERCHANT_BACKUP_SOURCE_URL = os.environ.get(
     'MERCHANT_BACKUP_SOURCE_URL',

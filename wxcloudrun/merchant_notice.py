@@ -33,8 +33,8 @@ DEFAULT_NOTICE_ACTION = '打开蛋查查'
 DEV_SELF_TEST_ITEM_NAMES = ('炫彩蛋', '棱镜球')
 DEV_SELF_TEST_ACTION = '返回蛋查查'
 ROUND_START_HOURS = (8, 12, 16, 20)
-MERCHANT_BACKUP_PRIMARY_ONLY_START_MINUTE = 1
-MERCHANT_BACKUP_PRIMARY_ONLY_END_MINUTE = 5
+MERCHANT_PREFERRED_SOURCE_ONLY_START_MINUTE = 1
+MERCHANT_PREFERRED_SOURCE_ONLY_END_MINUTE = 5
 MERCHANT_SOURCE_PRIMARY = 'primary'
 MERCHANT_SOURCE_BACKUP = 'backup'
 WECHAT_STABLE_TOKEN_URL = 'https://api.weixin.qq.com/cgi-bin/stable_token'
@@ -89,6 +89,10 @@ class MerchantNoticeValidationError(MerchantNoticeError):
 
 
 class MerchantNoticeSourceError(MerchantNoticeError):
+    pass
+
+
+class MerchantNoticeSourceNotReadyError(MerchantNoticeSourceError):
     pass
 
 
@@ -283,7 +287,7 @@ def has_special_keyword(name):
 def get_merchant_source_priority_list():
     raw = str(getattr(settings, 'MERCHANT_SOURCE_PRIORITY', '') or '').strip()
     if not raw:
-        raw = f'{MERCHANT_SOURCE_PRIMARY},{MERCHANT_SOURCE_BACKUP}'
+        raw = f'{MERCHANT_SOURCE_BACKUP},{MERCHANT_SOURCE_PRIMARY}'
 
     source_names = []
     for item in raw.replace('，', ',').split(','):
@@ -292,7 +296,23 @@ def get_merchant_source_priority_list():
             source_names.append(normalized)
 
     if not source_names:
-        return [MERCHANT_SOURCE_PRIMARY, MERCHANT_SOURCE_BACKUP]
+        return [MERCHANT_SOURCE_BACKUP, MERCHANT_SOURCE_PRIMARY]
+    return source_names
+
+
+def get_merchant_watch_source_priority_list():
+    raw = str(getattr(settings, 'MERCHANT_WATCH_SOURCE_PRIORITY', '') or '').strip()
+    if not raw:
+        raw = f'{MERCHANT_SOURCE_BACKUP},{MERCHANT_SOURCE_PRIMARY}'
+
+    source_names = []
+    for item in raw.replace('\uff0c', ',').split(','):
+        normalized = normalize_text(item, 32).lower()
+        if normalized in {MERCHANT_SOURCE_PRIMARY, MERCHANT_SOURCE_BACKUP} and normalized not in source_names:
+            source_names.append(normalized)
+
+    if not source_names:
+        return [MERCHANT_SOURCE_BACKUP, MERCHANT_SOURCE_PRIMARY]
     return source_names
 
 
@@ -359,6 +379,38 @@ def parse_next_refresh_at(value, slot_date, round_number):
     return build_round_window(slot_date, round_number)[1]
 
 
+def parse_item_availability_datetime(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return parse_naive_local(value)
+
+    text = normalize_text(value, 32)
+    if not text:
+        return None
+
+    try:
+        return parse_naive_local(datetime.fromisoformat(text))
+    except ValueError:
+        pass
+
+    for date_format in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S'):
+        try:
+            return parse_naive_local(datetime.strptime(text, date_format))
+        except ValueError:
+            continue
+    return None
+
+
+def attach_item_availability(item, start_at=None, end_at=None):
+    normalized_item = dict(item)
+    if start_at:
+        normalized_item['availableStartAt'] = format_iso_datetime(start_at)
+    if end_at:
+        normalized_item['availableEndAt'] = format_iso_datetime(end_at)
+    return normalized_item
+
+
 def compute_payload_fingerprint(payload):
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()
@@ -383,8 +435,9 @@ def normalize_primary_source_payload(raw_payload):
     slot_date = parse_slot_date(raw_payload.get('slot_date'))
     round_number = max(parse_int(raw_payload.get('round'), 1), 1)
     total_rounds = max(parse_int(raw_payload.get('total_rounds'), 4), 1)
+    round_start_at, round_end_at = build_round_window(slot_date, round_number)
     items = [
-        normalize_source_item(item)
+        attach_item_availability(normalize_source_item(item), round_start_at, round_end_at)
         for item in (raw_payload.get('items') or [])
         if isinstance(item, dict) and normalize_goods_name(item.get('name'))
     ]
@@ -455,6 +508,50 @@ def find_backup_merchant_activity(raw_payload):
         if isinstance(activity, dict):
             return activity
     return {}
+
+
+def find_current_backup_merchant_activity(raw_payload):
+    data = raw_payload.get('data') if isinstance(raw_payload.get('data'), dict) else {}
+    activities = data.get('merchantActivities') or []
+    if not isinstance(activities, list):
+        return {}
+
+    merchant_activities = [
+        activity for activity in activities
+        if isinstance(activity, dict) and normalize_text(activity.get('name'), 32) == '远行商人'
+    ]
+    candidates = merchant_activities or [
+        activity for activity in activities
+        if isinstance(activity, dict)
+    ]
+    if not candidates:
+        return {}
+
+    current_time = get_local_now()
+    active_candidates = []
+    for activity in candidates:
+        start_at = parse_backup_timestamp_ms(activity.get('start_time'))
+        end_at = parse_backup_timestamp_ms(activity.get('end_time'))
+        if start_at and start_at <= current_time and (not end_at or current_time < end_at):
+            active_candidates.append(activity)
+    if active_candidates:
+        return sorted(
+            active_candidates,
+            key=lambda activity: parse_int(activity.get('start_time'), 0),
+        )[0]
+
+    current_date_text = current_time.date().isoformat()
+    same_day_candidates = [
+        activity for activity in candidates
+        if normalize_text(activity.get('start_date'), 16) == current_date_text
+    ]
+    if same_day_candidates:
+        return sorted(
+            same_day_candidates,
+            key=lambda activity: parse_int(activity.get('start_time'), 0),
+        )[0]
+
+    return candidates[0]
 
 
 def infer_round_number_from_start(start_at, slot_date):
@@ -532,7 +629,7 @@ def normalize_backup_source_payload(raw_payload):
     if parse_int(raw_payload.get('code'), -1) != 0:
         raise MerchantNoticeSourceError(f'远行商人备用源返回异常: {raw_payload}')
 
-    activity = find_backup_merchant_activity(raw_payload)
+    activity = find_current_backup_merchant_activity(raw_payload)
     if not activity:
         raise MerchantNoticeSourceError('远行商人备用源未返回 merchantActivities.远行商人 数据')
 
@@ -544,15 +641,16 @@ def normalize_backup_source_payload(raw_payload):
     ]
     round_number, selected_start_at, selected_items = select_backup_round_items(normalized_items, slot_date)
     if not selected_start_at:
-        raise MerchantNoticeSourceError('远行商人备用源当前场次数据尚未完整更新')
+        raise MerchantNoticeSourceNotReadyError('backup merchant source current round is not ready')
     total_rounds = len(ROUND_START_HOURS)
     _, next_refresh_at = build_round_window(slot_date, round_number)
     source_updated_at = parse_backup_timestamp_ms(activity.get('created_at')) or get_local_now()
     items = []
     for item in selected_items:
         normalized_item = dict(item)
-        normalized_item.pop('startAt', None)
-        normalized_item.pop('endAt', None)
+        item_start_at = normalized_item.pop('startAt', None) or selected_start_at
+        item_end_at = normalized_item.pop('endAt', None) or next_refresh_at
+        normalized_item = attach_item_availability(normalized_item, item_start_at, item_end_at)
         items.append(normalized_item)
 
     special_item_names = [item['name'] for item in items if item['isSpecial']]
@@ -780,12 +878,12 @@ def fetch_display_source_payload(force=False, use_cache=True):
     return payload
 
 
-def get_backup_primary_only_window(now=None):
+def get_preferred_source_only_window(now=None):
     current_time = now or get_local_now()
     for round_hour in ROUND_START_HOURS:
         round_start_at = datetime.combine(current_time.date(), dt_time(hour=round_hour), tzinfo=get_local_timezone())
-        window_start_at = round_start_at + timedelta(minutes=MERCHANT_BACKUP_PRIMARY_ONLY_START_MINUTE)
-        window_end_at = round_start_at + timedelta(minutes=MERCHANT_BACKUP_PRIMARY_ONLY_END_MINUTE)
+        window_start_at = round_start_at + timedelta(minutes=MERCHANT_PREFERRED_SOURCE_ONLY_START_MINUTE)
+        window_end_at = round_start_at + timedelta(minutes=MERCHANT_PREFERRED_SOURCE_ONLY_END_MINUTE)
         if window_start_at <= current_time < window_end_at:
             return {
                 'active': True,
@@ -835,22 +933,95 @@ def build_watch_source_candidate(source_name, payload, latest_snapshot=None):
     }
 
 
+def build_latest_snapshot_watch_probe(latest_snapshot, source_attempts, status, window=None):
+    if not latest_snapshot:
+        return None
+
+    payload = serialize_snapshot(latest_snapshot)
+    payload_summary = summarize_payload(payload)
+    attempt_summary = dict(payload_summary)
+    attempt_summary.update({
+        'sourceName': 'latest_snapshot',
+        'status': status,
+        'isReady': is_ready_snapshot_payload(payload),
+        'isSameFingerprint': True,
+    })
+    if window:
+        attempt_summary.update({
+            'windowStartAt': window['startAt'],
+            'windowEndAt': window['endAt'],
+        })
+    source_attempts.append(attempt_summary)
+    return {
+        'payload': payload,
+        'payloadSummary': payload_summary,
+        'sourceName': 'latest_snapshot',
+        'sourceAttempts': source_attempts,
+    }
+
+
 def fetch_watch_source_payload(latest_snapshot=None):
     errors = []
     source_attempts = []
-    best_candidate = None
-    primary_only_window = get_backup_primary_only_window()
+    source_names = get_merchant_watch_source_priority_list()
+    preferred_source = source_names[0]
+    fallback_sources = source_names[1:]
+    preferred_only_window = get_preferred_source_only_window()
 
-    for source_name in get_merchant_source_priority_list():
-        if source_name == MERCHANT_SOURCE_BACKUP and primary_only_window['active']:
+    try:
+        preferred_payload = fetch_source_payload_from_priority(preferred_source)
+    except MerchantNoticeSourceNotReadyError as error:
+        errors.append(f'{preferred_source}: {error}')
+        source_attempts.append({
+            'sourceName': preferred_source,
+            'status': 'not_ready',
+            'error': normalize_text(error, 255),
+        })
+        latest_probe = build_latest_snapshot_watch_probe(
+            latest_snapshot,
+            source_attempts,
+            'unchanged_preferred_source_not_ready',
+        )
+        if latest_probe:
+            return latest_probe
+        raise MerchantNoticeSourceError('; '.join(errors))
+    except MerchantNoticeSourceError as error:
+        errors.append(f'{preferred_source}: {error}')
+        source_attempts.append({
+            'sourceName': preferred_source,
+            'status': 'error',
+            'error': normalize_text(error, 255),
+        })
+    else:
+        candidate = build_watch_source_candidate(preferred_source, preferred_payload, latest_snapshot=latest_snapshot)
+        source_attempts.append(candidate['attemptSummary'])
+        return {
+            'payload': candidate['payload'],
+            'payloadSummary': candidate['payloadSummary'],
+            'sourceName': candidate['sourceName'],
+            'sourceAttempts': source_attempts,
+        }
+
+    if preferred_only_window['active']:
+        for source_name in fallback_sources:
             source_attempts.append({
                 'sourceName': source_name,
-                'status': 'skipped_primary_only_window',
-                'windowStartAt': primary_only_window['startAt'],
-                'windowEndAt': primary_only_window['endAt'],
+                'status': 'skipped_preferred_source_only_window',
+                'windowStartAt': preferred_only_window['startAt'],
+                'windowEndAt': preferred_only_window['endAt'],
             })
-            continue
+        latest_probe = build_latest_snapshot_watch_probe(
+            latest_snapshot,
+            source_attempts,
+            'unchanged_preferred_source_only_window',
+            window=preferred_only_window,
+        )
+        if latest_probe:
+            return latest_probe
+        raise MerchantNoticeSourceError('; '.join(errors))
 
+    best_fallback_candidate = None
+    for source_name in fallback_sources:
         try:
             payload = fetch_source_payload_from_priority(source_name)
         except MerchantNoticeSourceError as error:
@@ -864,43 +1035,21 @@ def fetch_watch_source_payload(latest_snapshot=None):
 
         candidate = build_watch_source_candidate(source_name, payload, latest_snapshot=latest_snapshot)
         source_attempts.append(candidate['attemptSummary'])
-
-        if best_candidate is None or candidate['rank'] > best_candidate['rank']:
-            best_candidate = candidate
-
+        if best_fallback_candidate is None or candidate['rank'] > best_fallback_candidate['rank']:
+            best_fallback_candidate = candidate
         if candidate['status'] == 'ready_changed':
             return {
-                'payload': payload,
+                'payload': candidate['payload'],
                 'payloadSummary': candidate['payloadSummary'],
-                'sourceName': source_name,
+                'sourceName': candidate['sourceName'],
                 'sourceAttempts': source_attempts,
             }
 
-    if best_candidate:
+    if best_fallback_candidate:
         return {
-            'payload': best_candidate['payload'],
-            'payloadSummary': best_candidate['payloadSummary'],
-            'sourceName': best_candidate['sourceName'],
-            'sourceAttempts': source_attempts,
-        }
-
-    if primary_only_window['active'] and latest_snapshot:
-        payload = serialize_snapshot(latest_snapshot)
-        payload_summary = summarize_payload(payload)
-        attempt_summary = dict(payload_summary)
-        attempt_summary.update({
-            'sourceName': 'latest_snapshot',
-            'status': 'unchanged_primary_only_window',
-            'isReady': is_ready_snapshot_payload(payload),
-            'isSameFingerprint': True,
-            'windowStartAt': primary_only_window['startAt'],
-            'windowEndAt': primary_only_window['endAt'],
-        })
-        source_attempts.append(attempt_summary)
-        return {
-            'payload': payload,
-            'payloadSummary': payload_summary,
-            'sourceName': 'latest_snapshot',
+            'payload': best_fallback_candidate['payload'],
+            'payloadSummary': best_fallback_candidate['payloadSummary'],
+            'sourceName': best_fallback_candidate['sourceName'],
             'sourceAttempts': source_attempts,
         }
 
@@ -1748,13 +1897,35 @@ def get_snapshot_item_names(snapshot):
     ])
 
 
+def is_snapshot_item_notice_eligible(snapshot, item):
+    if not isinstance(item, dict) or not normalize_goods_name(item.get('name')):
+        return False
+
+    available_start_at = parse_item_availability_datetime(
+        item.get('availableStartAt') or item.get('startAt')
+    )
+    if not available_start_at:
+        return True
+
+    round_start_at, round_end_at = build_round_window(snapshot.slot_date, snapshot.round)
+    return round_start_at <= available_start_at < round_end_at
+
+
+def get_snapshot_notice_item_names(snapshot):
+    return dedupe_goods_names([
+        item.get('name')
+        for item in load_items_json(snapshot.items_json)
+        if is_snapshot_item_notice_eligible(snapshot, item)
+    ])
+
+
 def get_matching_selected_goods(subscription, snapshot):
     selected_goods = set(get_effective_selected_goods(subscription))
     if not selected_goods:
         return []
     return sort_goods_by_notice_priority([
         item_name
-        for item_name in get_snapshot_item_names(snapshot)
+        for item_name in get_snapshot_notice_item_names(snapshot)
         if item_name in selected_goods
     ])
 
