@@ -53,6 +53,10 @@ _CURRENT_PAYLOAD_CACHE = {
     'payload': None,
     'expires_at': 0.0,
 }
+_DISPLAY_PAYLOAD_CACHE = {
+    'payload': None,
+    'expires_at': 0.0,
+}
 _ACCESS_TOKEN_CACHE = {
     'token': '',
     'expires_at': 0.0,
@@ -668,6 +672,114 @@ def fetch_source_payload(force=False, use_cache=True):
     raise MerchantNoticeSourceError('；'.join(errors) if errors else '远行商人数据源全部请求失败')
 
 
+def is_same_payload_round(left, right):
+    if not left or not right:
+        return False
+    return (
+        normalize_text(left.get('slotDate'), 16) == normalize_text(right.get('slotDate'), 16)
+        and parse_int(left.get('round'), 0) == parse_int(right.get('round'), 0)
+    )
+
+
+def build_item_lookup(payload):
+    lookup = {}
+    for item in (payload or {}).get('items') or []:
+        if not isinstance(item, dict):
+            continue
+        item_name = normalize_goods_name(item.get('name'))
+        if item_name and item_name not in lookup:
+            lookup[item_name] = item
+    return lookup
+
+
+def merge_display_payload(base_payload, supplement_payload):
+    if not is_same_payload_round(base_payload, supplement_payload):
+        return copy.deepcopy(base_payload)
+
+    merged_payload = copy.deepcopy(base_payload)
+    supplement_items = build_item_lookup(supplement_payload)
+    seen_names = set()
+    merged_items = []
+
+    for item in merged_payload.get('items') or []:
+        if not isinstance(item, dict):
+            continue
+        merged_item = dict(item)
+        item_name = normalize_goods_name(merged_item.get('name'))
+        supplement_item = supplement_items.get(item_name)
+        if supplement_item:
+            if parse_int(merged_item.get('price'), 0) <= 0 and parse_int(supplement_item.get('price'), 0) > 0:
+                merged_item['price'] = parse_int(supplement_item.get('price'), 0)
+            if (
+                parse_int(merged_item.get('purchaseLimit'), 0) <= 0
+                and parse_int(supplement_item.get('purchaseLimit'), 0) > 0
+            ):
+                merged_item['purchaseLimit'] = parse_int(supplement_item.get('purchaseLimit'), 0)
+            if not normalize_text(merged_item.get('image'), 512) and normalize_text(supplement_item.get('image'), 512):
+                merged_item['image'] = supplement_item.get('image')
+            merged_item['isSpecial'] = bool(merged_item.get('isSpecial') or supplement_item.get('isSpecial'))
+            merged_item['isHighlight'] = bool(merged_item.get('isHighlight') or supplement_item.get('isHighlight'))
+            merged_item['sourceHighlight'] = bool(merged_item.get('sourceHighlight') or supplement_item.get('sourceHighlight'))
+        if item_name:
+            seen_names.add(item_name)
+        merged_items.append(merged_item)
+
+    for item_name, supplement_item in supplement_items.items():
+        if item_name in seen_names:
+            continue
+        merged_items.append(copy.deepcopy(supplement_item))
+
+    merged_payload['items'] = merged_items
+    special_item_names = [item['name'] for item in merged_items if item.get('isSpecial')]
+    merged_payload['hasSpecialHit'] = bool(special_item_names)
+    merged_payload['specialItemNames'] = special_item_names
+    merged_payload['fingerprint'] = compute_payload_fingerprint({
+        'slotDate': merged_payload.get('slotDate'),
+        'round': merged_payload.get('round'),
+        'totalRounds': merged_payload.get('totalRounds'),
+        'items': merged_items,
+    })
+    return merged_payload
+
+
+def fetch_display_source_payload(force=False, use_cache=True):
+    cache_ttl = max(int(getattr(settings, 'MERCHANT_NOTICE_CACHE_TTL_SECONDS', 30) or 30), 0)
+    if (
+        use_cache
+        and not force
+        and _DISPLAY_PAYLOAD_CACHE['payload']
+        and _DISPLAY_PAYLOAD_CACHE['expires_at'] > time.monotonic()
+    ):
+        return copy.deepcopy(_DISPLAY_PAYLOAD_CACHE['payload'])
+
+    errors = []
+    primary_payload = None
+    backup_payload = None
+
+    try:
+        backup_payload = fetch_backup_source_payload()
+    except MerchantNoticeSourceError as error:
+        errors.append(f'{MERCHANT_SOURCE_BACKUP}: {error}')
+
+    try:
+        primary_payload = fetch_primary_source_payload()
+    except MerchantNoticeSourceError as error:
+        errors.append(f'{MERCHANT_SOURCE_PRIMARY}: {error}')
+
+    if backup_payload and primary_payload:
+        payload = merge_display_payload(backup_payload, primary_payload)
+    elif backup_payload:
+        payload = backup_payload
+    elif primary_payload:
+        payload = primary_payload
+    else:
+        raise MerchantNoticeSourceError('；'.join(errors) if errors else '远行商人展示数据源全部请求失败')
+
+    _DISPLAY_PAYLOAD_CACHE['payload'] = copy.deepcopy(payload)
+    _DISPLAY_PAYLOAD_CACHE['expires_at'] = time.monotonic() + cache_ttl
+    return payload
+
+
 def get_backup_primary_only_window(now=None):
     current_time = now or get_local_now()
     for round_hour in ROUND_START_HOURS:
@@ -946,7 +1058,7 @@ def finish_watch_job_run(status, result):
 def get_current_payload_for_display():
     latest_snapshot = get_latest_snapshot()
     try:
-        current_payload = fetch_source_payload(force=False, use_cache=True)
+        current_payload = fetch_display_source_payload(force=False, use_cache=True)
         return current_payload, False
     except MerchantNoticeSourceError:
         if latest_snapshot:
