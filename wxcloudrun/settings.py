@@ -275,7 +275,7 @@ MERCHANT_SOURCE_USER_AGENT = os.environ.get(
 ).strip()
 MERCHANT_SOURCE_PRIORITY = os.environ.get(
     'MERCHANT_SOURCE_PRIORITY',
-    'backup,primary',
+    'primary',
 ).strip()
 MERCHANT_WATCH_SOURCE_PRIORITY = os.environ.get(
     'MERCHANT_WATCH_SOURCE_PRIORITY',
@@ -291,7 +291,7 @@ MERCHANT_BACKUP_SOURCE_REFERER = os.environ.get(
 ).strip()
 MERCHANT_BACKUP_SOURCE_API_KEY = os.environ.get(
     'MERCHANT_BACKUP_SOURCE_API_KEY',
-    'sk-0c1476b201301170e6360453becb27f5',
+    'sk-55abb23c8d9fae41535611000c0e8bdf',
 ).strip()
 MERCHANT_NOTIFY_TEMPLATE_ID = os.environ.get(
     'MERCHANT_NOTIFY_TEMPLATE_ID',

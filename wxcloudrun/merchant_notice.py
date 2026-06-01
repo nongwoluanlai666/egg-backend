@@ -850,28 +850,7 @@ def fetch_display_source_payload(force=False, use_cache=True):
     ):
         return copy.deepcopy(_DISPLAY_PAYLOAD_CACHE['payload'])
 
-    errors = []
-    primary_payload = None
-    backup_payload = None
-
-    try:
-        backup_payload = fetch_backup_source_payload()
-    except MerchantNoticeSourceError as error:
-        errors.append(f'{MERCHANT_SOURCE_BACKUP}: {error}')
-
-    try:
-        primary_payload = fetch_primary_source_payload()
-    except MerchantNoticeSourceError as error:
-        errors.append(f'{MERCHANT_SOURCE_PRIMARY}: {error}')
-
-    if backup_payload and primary_payload:
-        payload = merge_display_payload(backup_payload, primary_payload)
-    elif backup_payload:
-        payload = backup_payload
-    elif primary_payload:
-        payload = primary_payload
-    else:
-        raise MerchantNoticeSourceError('；'.join(errors) if errors else '远行商人展示数据源全部请求失败')
+    payload = fetch_primary_source_payload()
 
     _DISPLAY_PAYLOAD_CACHE['payload'] = copy.deepcopy(payload)
     _DISPLAY_PAYLOAD_CACHE['expires_at'] = time.monotonic() + cache_ttl
